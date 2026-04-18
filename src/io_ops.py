@@ -55,13 +55,13 @@ def _local_dt_to_filetime_100ns(when: datetime) -> int:
 
 
 def _set_creation_time_powershell(path: Path, when: datetime) -> None:
-    s = when.strftime("%Y-%m-%d %H:%M:%S")
+    """Set CreationTime from the same UTC instant as ``when.timestamp()`` (aware or naive)."""
     p = str(path.resolve())
     p_ps = p.replace("'", "''")
+    ms = int(round(when.timestamp() * 1000))
     cmd = (
         f"(Get-Item -LiteralPath '{p_ps}').CreationTime = "
-        "[DateTime]::ParseExact("
-        f"'{s}','yyyy-MM-dd HH:mm:ss',[System.Globalization.CultureInfo]::InvariantCulture)"
+        f"([DateTimeOffset]::FromUnixTimeMilliseconds([long]{ms})).LocalDateTime"
     )
     r = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
@@ -379,6 +379,41 @@ def resolve_log_path_arg(v: str) -> Path:
     return Path(v).expanduser().resolve()
 
 
+def _pc_local_utc_offset_colon() -> str:
+    """Current OS zone offset like ``+02:00`` (for annotating naive wall times)."""
+    dt = datetime.now().astimezone()
+    s = dt.strftime("%z")
+    if len(s) == 5 and s[0] in "+-":
+        return f"{s[:3]}:{s[3:]}"
+    return s or "unknown"
+
+
+def _fmt_naive_dt_with_pc_zone(dt: datetime) -> str:
+    """Naive source/copy wall time with explicit PC zone, e.g. ``2023-10-25 07:15:00 [+03:00]``."""
+    return f"{dt.isoformat(sep=' ', timespec='seconds')} [{_pc_local_utc_offset_colon()}]"
+
+
+def _fmt_set_created_display(dt: datetime | None) -> str:
+    """Aware datetimes include offset in ISO string; naive rules get `` [+xx:xx]`` for PC zone."""
+    if dt is None:
+        return "-"
+    if dt.tzinfo is not None:
+        return dt.isoformat(sep=" ", timespec="seconds")
+    return _fmt_naive_dt_with_pc_zone(dt)
+
+
+def _fmt_exif_display(exif_original: datetime | None, exif_capture_hint: str | None) -> str:
+    if exif_original is not None:
+        return exif_original.isoformat(sep=" ", timespec="seconds")
+    if exif_capture_hint:
+        for part in exif_capture_hint.split(";"):
+            part = part.strip()
+            if part.startswith("tz~GPS="):
+                return f"-  [{part.split('=', 1)[1]}]"
+        return f"-  ({exif_capture_hint})"
+    return "-"
+
+
 def emit_file_summary(
     *,
     out: Any,
@@ -390,22 +425,22 @@ def emit_file_summary(
     dest_text: str,
     outcome_text: str,
     exif_capture_hint: str | None = None,
+    materialized_created: datetime | None = None,
 ) -> None:
     from .rules import primary_time_action
 
     primary = primary_time_action(planned)
     rule = primary.kind if primary is not None else "move_only_no_time_change"
-    change = (
-        primary.new_created.isoformat(sep=" ", timespec="seconds")
-        if (primary is not None and primary.new_created is not None)
-        else "-"
+    disp = (
+        materialized_created
+        if materialized_created is not None
+        else (primary.new_created if primary is not None else None)
     )
+    change = _fmt_set_created_display(disp)
 
-    exif_s = exif_original.isoformat(sep=" ", timespec="seconds") if exif_original else "-"
-    if exif_capture_hint:
-        exif_s = f"{exif_s} ({exif_capture_hint})" if exif_s != "-" else f"({exif_capture_hint})"
-    created_s = created.isoformat(sep=" ", timespec="seconds")
-    modified_s = modified.isoformat(sep=" ", timespec="seconds")
+    exif_s = _fmt_exif_display(exif_original, exif_capture_hint)
+    created_s = _fmt_naive_dt_with_pc_zone(created)
+    modified_s = _fmt_naive_dt_with_pc_zone(modified)
 
     out.write(f"{rel_posix}\n")
     out.write(f"  created={created_s}  modified={modified_s}  exif={exif_s}\n")

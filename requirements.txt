@@ -1,0 +1,8 @@
+# Runtime (pip install -r requirements.txt)
+pillow
+rich
+timezonefinder>=6.2.0
+
+backports.zoneinfo>=0.2.1; python_version < "3.9"
+# IANA zone names for ZoneInfo (needed on Windows for backports.zoneinfo / some 3.9+ installs)
+tzdata>=2024.1

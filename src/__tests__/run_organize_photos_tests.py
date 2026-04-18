@@ -24,7 +24,7 @@ import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -148,18 +148,16 @@ class FileExpectation:
 DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
     FileExpectation(
         "2014/solo.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=2014-12-31 23:59:59",
             "DRY-RUN would copy",
-            "2014",
+            "dest=by-year/{current_year}/solo.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Folder YYYY/ implies end-of-year; beats EXIF/filename.",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="2014-12-31 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="Dated folder alone does not set CreationTime; move-only without other signals.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
     FileExpectation(
         "2014/in_range.jpg",
@@ -170,72 +168,64 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "DRY-RUN would copy",
             "dest=by-year/2014/in_range.jpg",
         ),
-        must_not_contain=("[path_hierarchy_trusted]",),
+        must_not_contain=(),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Folder implies 2014 but file mtime is within 2014; folder rule is suppressed, so fallback uses mtime.",
+        dest_copy_created_after_note="Folder implies 2014; mtime within 2014 drives fallback (folders do not override).",
         dest_creation_time_touched=True,
         dest_copy_creation_after_iso="2014-06-01 10:00:00",
         touch_outcome="touched",
     ),
     FileExpectation(
         "2015/08/summer.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=2015-08-31 23:59:59",
             "DRY-RUN would copy",
-            "2015",
+            "dest=by-year/{current_year}/summer.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Folder YYYY/MM/ implies end-of-month; beats EXIF/filename.",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="2015-08-31 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="YYYY/MM/ folders are advisory only; no CreationTime change without other signals.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
     FileExpectation(
         "1994/06-Aug-1994/scan.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=1994-08-06 23:59:59",
             "DRY-RUN would copy",
-            "dest=by-year/1994/scan.jpg",
+            "dest=by-year/{current_year}/scan.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="DD-MMM-YYYY folder under year beats EXIF (e.g. scans).",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="1994-08-06 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="Dated folders do not set CreationTime; move-only without EXIF/filename/mtime rule.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
     FileExpectation(
         "1994/15.06.1994/eu.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=1994-06-15 23:59:59",
             "DRY-RUN would copy",
-            "dest=by-year/1994/eu.jpg",
+            "dest=by-year/{current_year}/eu.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="European DD.MM.YYYY folder (day first, not US).",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="1994-06-15 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="Dated folders do not set CreationTime; move-only without other signals.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
     FileExpectation(
         "1994-Aug/month_named.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=1994-08-31 23:59:59",
             "DRY-RUN would copy",
-            "dest=by-year/1994/month_named.jpg",
+            "dest=by-year/{current_year}/month_named.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Leading folder YYYY-Mmm (year before month).",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="1994-08-31 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="Leading folder YYYY-Mmm is advisory only for dating rules.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
     FileExpectation(
         "2020/01/15/20200115-120000/mismatch.jpg",
@@ -246,7 +236,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "DRY-RUN would copy",
             "dest=by-year/2010/mismatch.jpg",
         ),
-        must_not_contain=("path_calendar_recovery", "path_hierarchy_trusted"),
+        must_not_contain=(),
         source_created_before_note="created= ~ test run; modified= forced to 2010-06-01 (slug vs mtime mismatch).",
         dest_copy_created_after_note="Oldest of path slug, created, modified wins -> 2010-06-01 08:00:00 (mtime).",
         dest_creation_time_touched=True,
@@ -318,7 +308,6 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
         ),
         must_not_contain=(
             "[filename_earlier_than_metadata]",
-            "[path_calendar_recovery]",
             "[structured_path_mismatch]",
             "[exif_earlier_than_metadata]",
         ),
@@ -377,7 +366,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "DRY-RUN would copy",
             "dest=by-year/{current_year}/same.jpg",
         ),
-        must_not_contain=("[filename_earlier_than_metadata]", "[path_calendar_recovery]"),
+        must_not_contain=("[filename_earlier_than_metadata]",),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
         dest_copy_created_after_note="No new_created; copy keeps source CreationTime (dedupe incumbent wins later tie).",
         dest_creation_time_touched=False,
@@ -410,18 +399,16 @@ EXPECTED_ERRORS_ZERO = "Errors: 0"
 NARROW_SOURCE_EXPECTATIONS: tuple[FileExpectation, ...] = (
     FileExpectation(
         "month_named.jpg",
-        ("path_hierarchy_trusted",),
+        (),
         (
-            "path_hierarchy_trusted",
-            "set_created=1994-08-31 23:59:59",
             "DRY-RUN would copy",
-            "dest=by-year-narrow/1994/month_named.jpg",
+            "dest=by-year-narrow/{current_year}/month_named.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Dated folder is --source; script includes source dir name for path calendar.",
-        dest_creation_time_touched=True,
-        dest_copy_creation_after_iso="1994-08-31 23:59:59",
-        touch_outcome="touched",
+        dest_copy_created_after_note="Dated folder is --source; folders are advisory only for dating rules.",
+        dest_creation_time_touched=False,
+        dest_copy_creation_after_iso=None,
+        touch_outcome="untouched_same_as_source",
     ),
 )
 EXPECTED_NARROW_PROCESSED_COUNT = 1
@@ -599,8 +586,6 @@ def check_expectations(output: str, errors: list[str]) -> None:
         # `[dry-run]` is not captured as a single tag (hyphen). Match known dating rule kinds only.
         rule_set = {
             "filename_earlier_than_metadata",
-            "path_calendar_recovery",
-            "path_hierarchy_trusted",
             "structured_path_mismatch",
             "structured_path_oldest_signal",
             "structured_path_align_created",
@@ -654,8 +639,6 @@ def check_narrow_source_expectations(output: str, errors: list[str]) -> None:
         tags = _tags_in_block(block)
         rule_set = {
             "filename_earlier_than_metadata",
-            "path_calendar_recovery",
-            "path_hierarchy_trusted",
             "structured_path_mismatch",
             "structured_path_oldest_signal",
             "structured_path_align_created",
@@ -719,6 +702,159 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         now = datetime(2026, 4, 13, 12, 0, 0)
         cfg = op.HeuristicConfig()
 
+        # --- GPS → IANA timezone (timezonefinder; skip if unavailable) ---
+        from src.datetime_policy import (
+            infer_timezone_name_from_gps as _gps_tz,
+            naive_exif_with_gps_local_timezone,
+            parse_exif_offset_string,
+        )
+        from src.extractors import _gps_ifd_to_lat_lon
+        from src.models import ExifCaptureInfo
+
+        munich = _gps_tz(48.137154, 11.576124)
+        if munich is not None and munich != "Europe/Berlin":
+            errors.append(
+                f"timezonefinder Munich: expected Europe/Berlin, got {munich!r}"
+            )
+
+        if _gps_tz(200.0, 0.0) is not None:
+            errors.append("infer_timezone_name_from_gps: invalid lat should return None")
+        ny_tz = _gps_tz(40.7128, -74.0060)
+        if ny_tz is not None and ny_tz != "America/New_York":
+            errors.append(f"timezonefinder NYC: expected America/New_York, got {ny_tz!r}")
+
+        # EXIF GPS IFD → lat/lon (synthetic dict, same shape as Pillow)
+        berlin_gps = {
+            1: b"N",
+            2: ((52, 1), (31, 1), (0, 1)),
+            3: b"E",
+            4: ((13, 1), (24, 1), (0, 1)),
+        }
+        ll = _gps_ifd_to_lat_lon(berlin_gps)
+        if ll is None:
+            errors.append("_gps_ifd_to_lat_lon: expected Berlin-ish coordinates")
+        else:
+            blat, blon = ll
+            if abs(blat - (52 + 31 / 60.0)) > 0.001 or abs(blon - (13 + 24 / 60.0)) > 0.001:
+                errors.append(f"_gps_ifd_to_lat_lon DMS decode wrong: {ll!r}")
+
+        south_west = {
+            1: b"S",
+            2: ((10, 1), (0, 1), (0, 1)),
+            3: b"W",
+            4: ((20, 1), (0, 1), (0, 1)),
+        }
+        ll_sw = _gps_ifd_to_lat_lon(south_west)
+        if ll_sw is None or ll_sw[0] >= 0 or ll_sw[1] >= 0:
+            errors.append(f"_gps_ifd_to_lat_lon S/W refs: expected negative lat/lon, got {ll_sw!r}")
+
+        # naive_exif + GPS → aware + zone name (needs zoneinfo or backports.zoneinfo on Py<3.9)
+        _zi_available = True
+        try:
+            from zoneinfo import ZoneInfo  # noqa: F401
+        except ImportError:
+            try:
+                from backports.zoneinfo import ZoneInfo  # noqa: F401
+            except ImportError:
+                _zi_available = False
+        if munich is not None and _zi_available:
+            naive_t = datetime(2022, 6, 15, 14, 30, 0)
+            aw, zn, sk = naive_exif_with_gps_local_timezone(naive_t, 48.137154, 11.576124)
+            if sk is not None:
+                errors.append(
+                    f"naive_exif_with_gps_local_timezone: unexpected skip reason {sk!r}"
+                )
+            if zn != "Europe/Berlin":
+                errors.append(
+                    f"naive_exif_with_gps_local_timezone: expected Europe/Berlin, got {zn!r}"
+                )
+            if aw.tzinfo is None:
+                errors.append("naive_exif_with_gps_local_timezone: expected timezone-aware datetime")
+
+        def _fixed_offset_hours(tz, dt=None) -> float | None:
+            if tz is None:
+                return None
+            u = tz.utcoffset(dt or datetime(2020, 6, 15, 12, 0, 0))
+            if u is None:
+                return None
+            return u.total_seconds() / 3600.0
+
+        for label, s, want_h, want_m in (
+            ("+05:30", "+05:30", 5, 30),
+            ("+0530 compact", "+0530", 5, 30),
+            ("+12:45", "+12:45", 12, 45),
+            ("Z", "Z", 0, 0),
+            ("UTC", "UTC", 0, 0),
+            ("-04:30", "-04:30", -4, -30),
+        ):
+            tz = parse_exif_offset_string(s)
+            if tz is None:
+                errors.append(f"parse_exif_offset_string {label}: got None")
+                continue
+            h = _fixed_offset_hours(tz)
+            ex = want_h + want_m / 60.0
+            if h is None or abs(h - ex) > 1e-6:
+                errors.append(
+                    f"parse_exif_offset_string {label}: want offset hours {ex}, got {h!r}"
+                )
+        if parse_exif_offset_string("+99:00") is not None:
+            errors.append("parse_exif_offset_string should reject implausible +99:00")
+        if parse_exif_offset_string("+08:99") is not None:
+            errors.append("parse_exif_offset_string should reject invalid minutes")
+
+        from datetime import timezone as _tz
+
+        from src.datetime_policy import filesystem_instant_for_rule as _fs_inst
+
+        exif_plus8 = datetime(
+            2022, 10, 25, 14, 41, 38, tzinfo=_tz(timedelta(hours=8))
+        )
+        fn_stem = datetime(2022, 10, 25, 14, 41, 35)
+        fs_out = _fs_inst(
+            fn_stem, "filename_earlier_than_metadata", exif_plus8, "Asia/Singapore"
+        )
+        want_ts = datetime(
+            2022, 10, 25, 14, 41, 35, tzinfo=_tz(timedelta(hours=8))
+        ).timestamp()
+        if fs_out.tzinfo is None or abs(fs_out.timestamp() - want_ts) > 1.0:
+            errors.append(
+                f"filesystem_instant_for_rule: expected +08 instant, got {fs_out!r}"
+            )
+        fs_plain = _fs_inst(
+            datetime(2010, 6, 1, 8, 0, 0),
+            "structured_path_oldest_signal",
+            exif_plus8,
+            None,
+        )
+        if fs_plain.tzinfo is not None:
+            errors.append("filesystem_instant_for_rule must not attach TZ for non filename/exif rules")
+
+        # ExifCaptureInfo hint_string: tz~GPS replaces redundant GPS=yes
+        cap = ExifCaptureInfo(
+            datetime(2020, 1, 1, 12, 0, 0),
+            has_gps=True,
+            gps_timezone_name="Europe/Berlin",
+        )
+        hs = cap.hint_string() or ""
+        if "tz~GPS=Europe/Berlin" not in hs:
+            errors.append(f"ExifCaptureInfo hint missing tz~GPS: {hs!r}")
+        if "GPS=yes" in hs:
+            errors.append("ExifCaptureInfo hint should not add GPS=yes when tz~GPS is set")
+        cap2 = ExifCaptureInfo(datetime(2020, 1, 1, 12, 0, 0), has_gps=True)
+        hs2 = cap2.hint_string() or ""
+        if "GPS=yes" not in hs2:
+            errors.append(f"ExifCaptureInfo has_gps only: expected GPS=yes in {hs2!r}")
+        cap_skip = ExifCaptureInfo(
+            datetime(2020, 1, 1, 12, 0, 0),
+            has_gps=True,
+            gps_tz_skip="no timezonefinder",
+        )
+        hs_skip = cap_skip.hint_string() or ""
+        if "GPS~no_tz=no timezonefinder" not in hs_skip:
+            errors.append(f"ExifCaptureInfo gps_tz_skip hint: {hs_skip!r}")
+        if "GPS=yes" in hs_skip:
+            errors.append("ExifCaptureInfo should prefer GPS~no_tz over GPS=yes")
+
         # --- EXIF vs mtime 1-day tolerance ---
         exif = datetime(2010, 6, 14, 8, 0, 0)
         modified = datetime(2010, 6, 15, 6, 0, 0)
@@ -756,6 +892,82 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         if not any(a.kind == "exif_earlier_than_metadata" for a in acts_over):
             errors.append(
                 "EXIF >24h before mtime should still trigger exif_earlier_than_metadata"
+            )
+
+        # EXIF vs filename clock within 1 minute (camera DCIM): prefer filename, not exif-alone.
+        fs_dcim = datetime(2023, 11, 19, 4, 7, 0)
+        exif_dcim = datetime(2022, 11, 19, 10, 7, 3)
+        acts_dcim = op.decide_actions(
+            [],
+            "IMG_20221119_100659.jpg",
+            fs_dcim,
+            fs_dcim,
+            exif_dcim,
+            now,
+            cfg,
+        )
+        if any(a.kind == "exif_earlier_than_metadata" for a in acts_dcim):
+            errors.append(
+                "EXIF within 1min of filename clock should not use exif_earlier_than_metadata alone"
+            )
+        pk_dcim = op.primary_time_action(acts_dcim)
+        if pk_dcim is None or pk_dcim.kind != "filename_earlier_than_metadata":
+            errors.append(
+                "DCIM skew: expected filename_earlier_than_metadata, got "
+                f"{[a.kind for a in acts_dcim]}"
+            )
+        elif pk_dcim.new_created != datetime(2022, 11, 19, 10, 6, 59):
+            errors.append(
+                f"DCIM skew: expected filename 10:06:59, got {pk_dcim.new_created}"
+            )
+
+        # Same stem; EXIF >1 minute from filename clock → keep exif_earlier_than_metadata.
+        exif_wide_skew = datetime(2022, 11, 19, 10, 9, 0)
+        acts_exif_beats_fn = op.decide_actions(
+            [],
+            "IMG_20221119_100659.jpg",
+            fs_dcim,
+            fs_dcim,
+            exif_wide_skew,
+            now,
+            cfg,
+        )
+        pk_wide = op.primary_time_action(acts_exif_beats_fn)
+        if pk_wide is None or pk_wide.kind != "exif_earlier_than_metadata":
+            errors.append(
+                "EXIF >1min from filename clock: expected exif_earlier_than_metadata, got "
+                f"{[a.kind for a in acts_exif_beats_fn]}"
+            )
+        elif pk_wide.new_created != exif_wide_skew:
+            errors.append(
+                f"EXIF >1min skew: expected EXIF time {exif_wide_skew}, got {pk_wide.new_created}"
+            )
+
+        # Aware EXIF (+08): stem correlation must use civil clock, not host OS local.
+        exif_plus8 = datetime(
+            2022, 11, 19, 10, 7, 3, tzinfo=timezone(timedelta(hours=8))
+        )
+        acts_plus8 = op.decide_actions(
+            [],
+            "IMG_20221119_100659.jpg",
+            fs_dcim,
+            fs_dcim,
+            exif_plus8,
+            now,
+            cfg,
+        )
+        if any(a.kind == "exif_earlier_than_metadata" for a in acts_plus8):
+            errors.append(
+                "aware EXIF +08 vs stem: expected filename precedence, not exif_earlier_than_metadata"
+            )
+        pk_p8 = op.primary_time_action(acts_plus8)
+        if pk_p8 is None or pk_p8.kind != "filename_earlier_than_metadata":
+            errors.append(
+                f"aware +08 stem compare: expected filename rule, got {[a.kind for a in acts_plus8]}"
+            )
+        elif pk_p8.new_created != datetime(2022, 11, 19, 10, 6, 59):
+            errors.append(
+                f"aware +08: expected filename 10:06:59, got {pk_p8.new_created}"
             )
 
         # --- Filename timestamp vs mtime 1-day tolerance (timezone naive) ---
@@ -834,7 +1046,7 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         )
         kinds_shot = [a.kind for a in acts_shot]
         if "path_hierarchy_trusted" in kinds_shot:
-            errors.append("screenshot case: folder year must not override older filename time")
+            errors.append("screenshot case: path_hierarchy_trusted must not be emitted")
         if not any(a.kind == "filename_earlier_than_metadata" for a in acts_shot):
             errors.append("screenshot case: expected filename_earlier_than_metadata")
 
@@ -981,18 +1193,15 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         sc, rk = op.confidence_score([], "a.jpg")
         if sc != 30 or rk != "move_only_no_time_change":
             errors.append(f"confidence move-only: {(sc,rk)}")
-        ph = [
+        exif_leg = [
             op.Action(
-                "path_hierarchy_trusted",
+                "exif_earlier_than_metadata",
                 "d",
                 new_created=datetime(2010, 1, 1),
             )
         ]
-        if op.confidence_score(ph, "a.jpg")[0] != 105:
-            errors.append("confidence path_hierarchy_trusted")
-        leg = [op.Action("path_calendar_recovery", "d", new_created=datetime(2005, 1, 1))]
-        if op.confidence_score(leg, "a.jpg") != (60, "path_calendar_recovery"):
-            errors.append("confidence path_calendar_recovery legacy")
+        if op.confidence_score(exif_leg, "a.jpg")[0] != 100:
+            errors.append("confidence exif_earlier_than_metadata")
         if not op.filename_has_anchor("IMG_20100615_143022.jpg"):
             errors.append("filename_has_anchor IMG_")
         if op.filename_has_anchor("plain.jpg"):

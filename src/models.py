@@ -79,6 +79,10 @@ class ExifCaptureInfo:
     offset_time_original: str | None = None
     offset_time_digitized: str | None = None
     has_gps: bool = False
+    #: IANA zone inferred from GPS when DateTime* had no OffsetTime tags (optional).
+    gps_timezone_name: str | None = None
+    #: When GPS was present but IANA/zone data could not be applied (verbose hint only).
+    gps_tz_skip: str | None = None
 
     def hint_string(self) -> str | None:
         parts: list[str] = []
@@ -86,7 +90,11 @@ class ExifCaptureInfo:
             parts.append(f"OffsetTimeOriginal={self.offset_time_original}")
         if self.offset_time_digitized and not self.offset_time_original:
             parts.append(f"OffsetTimeDigitized={self.offset_time_digitized}")
-        if self.has_gps:
+        if self.gps_timezone_name:
+            parts.append(f"tz~GPS={self.gps_timezone_name}")
+        elif self.gps_tz_skip:
+            parts.append(f"GPS~no_tz={self.gps_tz_skip}")
+        elif self.has_gps:
             parts.append("GPS=yes")
         return "; ".join(parts) if parts else None
 
@@ -101,6 +109,8 @@ class FileFacts:
     modified: datetime
     exif_original: datetime | None
     exif_capture_hint: str | None = None
+    #: IANA zone from GPS when EXIF had no offset (see :class:`ExifCaptureInfo`).
+    exif_gps_timezone_name: str | None = None
 
 
 @dataclass(frozen=True)

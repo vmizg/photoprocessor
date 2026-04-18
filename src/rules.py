@@ -7,10 +7,9 @@ from pathlib import Path
 
 from .datetime_policy import (
     TZ_NAIVE_VS_MODIFIED_EQUIV_MAX,
-    best_capture_time_for_folder_vs_metadata,
     exif_ambiguous_vs_modified,
+    exif_correlates_with_clock_filename,
     filename_ambiguous_vs_modified,
-    has_two_correlated_file_indicators,
     is_plausible_capture_date,
     naive_local,
 )
@@ -20,10 +19,7 @@ from .extractors import (
     _RE_SCREENSHOT_ANDROID,
     _RE_WA,
     extract_filename_datetime_entries,
-    is_apple_library_structured_path,
     match_structured_path,
-    path_has_calendar_hint,
-    path_implies_date_period,
 )
 from .models import Action, Decision, FileFacts, HeuristicConfig
 
@@ -38,10 +34,12 @@ def decide_actions(
     cfg: HeuristicConfig,
 ) -> list[Action]:
     actions: list[Action] = []
+    # Host-local normalization for filesystem / plausibility; stem correlation uses raw EXIF
+    # (see exif_civil_clock_for_stem_compare) so aware + offset is not mapped to OS timezone.
+    exif_as_read = exif_original
     if exif_original is not None:
         exif_original = naive_local(exif_original)
     earliest = min(created, modified)
-    path_hint_suppressed_by_file_time = False
     filename_hint_suppressed_by_mtime = False
     exif_hint_suppressed_by_mtime = False
 
@@ -50,43 +48,25 @@ def decide_actions(
     ]
     fn_dates = [d for d, _ in fn_entries]
 
-    if not is_apple_library_structured_path(rel_parts):
-        period = path_implies_date_period(rel_parts)
-        if period is not None:
-            start, end = period
-            if is_plausible_capture_date(end, now, cfg):
-                if has_two_correlated_file_indicators(
-                    fn_entries=fn_entries,
-                    exif_original=exif_original,
-                    modified=modified,
-                    now=now,
-                    cfg=cfg,
-                ):
-                    path_hint_suppressed_by_file_time = True
-                else:
-                    best_file_time = best_capture_time_for_folder_vs_metadata(
-                        fn_entries=fn_entries,
-                        exif_original=exif_original,
-                        modified=modified,
-                        now=now,
-                        cfg=cfg,
-                    )
-                    if best_file_time > end:
-                        actions.append(
-                            Action(
-                                "path_hierarchy_trusted",
-                                f"path folders imply {end.isoformat(sep=' ')} (overrides EXIF for manual layout)",
-                                new_created=end,
-                            )
-                        )
-                        return actions
-                    path_hint_suppressed_by_file_time = True
+    qualifying_filename_for_precedence = [
+        (d, inc)
+        for d, inc in fn_entries
+        if d < earliest
+        and not (inc and filename_ambiguous_vs_modified(d, modified))
+    ]
+    # Sub-minute skew vs clock-in-name → prefer filename (see EXIF_VS_FILENAME_CLOCK_MAX_DELTA).
+    suppress_exif_for_filename_clock = (
+        exif_as_read is not None
+        and qualifying_filename_for_precedence
+        and exif_correlates_with_clock_filename(exif_as_read, fn_entries)
+    )
 
     exif_ok = (
         exif_original is not None
         and is_plausible_capture_date(exif_original, now, cfg)
         and exif_original < earliest
         and not exif_ambiguous_vs_modified(exif_original, modified)
+        and not suppress_exif_for_filename_clock
     )
     if (
         exif_original is not None
@@ -96,23 +76,24 @@ def decide_actions(
         exif_hint_suppressed_by_mtime = True
 
     if exif_ok:
+        # Preserve offset-aware EXIF for correct filesystem instant; else naive-only EXIF.
+        nc = (
+            exif_as_read
+            if (exif_as_read is not None and exif_as_read.tzinfo is not None)
+            else exif_original
+        )
         actions.append(
             Action(
                 "exif_earlier_than_metadata",
                 f"EXIF original {exif_original.isoformat(sep=' ')} < earliest meta {earliest}",
-                new_created=exif_original,
+                new_created=nc,
             )
         )
         return actions
 
-    qualifying_entries = [(d, inc) for d, inc in fn_entries if d < earliest]
+    qualifying_entries = list(qualifying_filename_for_precedence)
     if any(inc and filename_ambiguous_vs_modified(d, modified) for d, inc in fn_entries):
         filename_hint_suppressed_by_mtime = True
-    qualifying_entries = [
-        (d, inc)
-        for d, inc in qualifying_entries
-        if not (inc and filename_ambiguous_vs_modified(d, modified))
-    ]
     if qualifying_entries:
         target, includes_clock = min(qualifying_entries, key=lambda x: x[0])
         # Filename tokens are naive local-at-capture; min(created,modified) is this copy's
@@ -202,9 +183,7 @@ def decide_actions(
             )
             return actions
 
-    if (not fn_dates or filename_hint_suppressed_by_mtime or exif_hint_suppressed_by_mtime) and (
-        not path_has_calendar_hint(rel_parts) or path_hint_suppressed_by_file_time
-    ):
+    if not fn_dates or filename_hint_suppressed_by_mtime or exif_hint_suppressed_by_mtime:
         if modified < created:
             actions.append(
                 Action(
@@ -256,7 +235,6 @@ def confidence_score(planned: list[Action], filename: str) -> tuple[int, str]:
     Return (score, rule_key) for how trustworthy the resolved date is.
     Higher = more confident. Tie-break: lower sequence wins (first processed).
 
-    Path hierarchy (dated folders, not Apple library slug layout) scores above EXIF.
     Filename rule: a *clock in the filename* (explicit H:M:S from regex) scores higher than
     date-only tokens. Anchored camera patterns (IMG_/PXL_) add a small boost on top.
     """
@@ -265,8 +243,6 @@ def confidence_score(planned: list[Action], filename: str) -> tuple[int, str]:
         return 30, "move_only_no_time_change"
 
     kind = primary.kind
-    if kind == "path_hierarchy_trusted":
-        return 105, kind
     if kind == "exif_earlier_than_metadata":
         return 100, kind
     if kind == "structured_path_align_created":
@@ -283,8 +259,6 @@ def confidence_score(planned: list[Action], filename: str) -> tuple[int, str]:
         if anchored:
             return 85, f"{kind}_anchored_date_only"
         return 75, f"{kind}_date_only"
-    if kind == "path_calendar_recovery":
-        return 60, kind
     if kind == "fallback_created_from_modified":
         return 40, kind
     return 30, kind

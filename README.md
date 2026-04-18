@@ -14,6 +14,8 @@ Or:
 python -m src.organize_photos --source ...
 ```
 
+**Dependencies:** `pip install -r requirements.txt` (Pillow, Rich, `timezonefinder`, `tzdata` for IANA zone names used with GPS inference; on Python before 3.9 also `backports.zoneinfo`).
+
 **Tests:**
 
 ```bash

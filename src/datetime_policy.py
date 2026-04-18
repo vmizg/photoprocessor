@@ -12,19 +12,42 @@ from .models import HeuristicConfig
 # EXIF and filename timestamps are usually timezone-naive; mtime is local.
 TZ_NAIVE_VS_MODIFIED_EQUIV_MAX = timedelta(days=1)
 
+# When EXIF vs clock-in-name disagree only slightly, prefer filename (camera stem).
+EXIF_VS_FILENAME_CLOCK_MAX_DELTA = timedelta(minutes=1)
+
 _RE_EXIF_OFFSET = re.compile(r"^([+-])(\d{1,2}):(\d{2})$")
+# Compact EXIF-style offsets without a colon, e.g. ``+0530`` for +5:30 (India).
+_RE_EXIF_OFFSET_COMPACT = re.compile(r"^([+-])(\d{2})(\d{2})$")
+
+
+def _tz_from_offset_hours_minutes(sign: int, hh: int, mm: int) -> timezone | None:
+    if mm < 0 or mm > 59 or hh < 0 or hh > 15:
+        return None
+    return timezone(sign * timedelta(hours=hh, minutes=mm))
 
 
 def parse_exif_offset_string(s: str) -> tzinfo | None:
     """
-    EXIF 2.31 OffsetTime / OffsetTimeOriginal values are ASCII like ``+08:00`` or ``-05:00``.
+    EXIF 2.31 OffsetTime / OffsetTimeOriginal values are ASCII like ``+08:00``, ``-05:00``,
+    ``+05:30`` (half-hour offsets), ``+0530`` (compact), or ``Z`` / ``UTC``.
     """
-    m = _RE_EXIF_OFFSET.match(s.strip())
-    if not m:
+    t = s.strip()
+    if not t:
         return None
-    sign = -1 if m.group(1) == "-" else 1
-    hh, mm = int(m.group(2)), int(m.group(3))
-    return timezone(sign * timedelta(hours=hh, minutes=mm))
+    ul = t.upper()
+    if ul in ("Z", "UTC"):
+        return timezone.utc
+    m = _RE_EXIF_OFFSET.match(t)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        hh, mm = int(m.group(2)), int(m.group(3))
+        return _tz_from_offset_hours_minutes(sign, hh, mm)
+    m2 = _RE_EXIF_OFFSET_COMPACT.match(t)
+    if m2:
+        sign = -1 if m2.group(1) == "-" else 1
+        hh, mm = int(m2.group(2)), int(m2.group(3))
+        return _tz_from_offset_hours_minutes(sign, hh, mm)
+    return None
 
 
 def attach_exif_offset_if_any(dt: datetime, offset_str: str | None) -> datetime:
@@ -35,6 +58,116 @@ def attach_exif_offset_if_any(dt: datetime, offset_str: str | None) -> datetime:
     if tz is None:
         return dt
     return dt.replace(tzinfo=tz)
+
+
+_tz_finder_singleton: object | None = None
+
+
+def _timezone_finder_instance():
+    """Lazy singleton; ``None`` if ``timezonefinder`` is not installed."""
+    global _tz_finder_singleton
+    if _tz_finder_singleton is False:
+        return None
+    if _tz_finder_singleton is not None:
+        return _tz_finder_singleton
+    try:
+        from timezonefinder import TimezoneFinder
+    except ImportError:
+        _tz_finder_singleton = False
+        return None
+    _tz_finder_singleton = TimezoneFinder()
+    return _tz_finder_singleton
+
+
+def infer_timezone_name_from_gps(lat: float, lon: float) -> str | None:
+    """
+    Map a WGS84 point to an IANA timezone name (offline polygons via ``timezonefinder``).
+
+    Returns ``None`` for oceans / lookup failure / missing dependency.
+    """
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    tf = _timezone_finder_instance()
+    if tf is None:
+        return None
+    try:
+        return tf.timezone_at(lat=lat, lng=lon)
+    except Exception:
+        return None
+
+
+def _zoneinfo_by_name(name: str):
+    """Resolve IANA name; needs ``tzdata`` on Windows for ``ZoneInfo`` lookups."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+    try:
+        return ZoneInfo(name)  # type: ignore[misc]
+    except Exception:
+        return None
+
+
+def naive_exif_with_gps_local_timezone(
+    naive_dt: datetime, lat: float, lon: float
+) -> tuple[datetime, str | None, str | None]:
+    """
+    EXIF without OffsetTime: treat naive clock as local civil time at ``(lat, lon)`` (EXIF spec).
+
+    Returns ``(aware_dt, iana_name, None)`` on success.
+
+    On failure, returns ``(naive_dt, None, reason)`` where ``reason`` explains why GPS-based
+    timezone was not applied (for verbose hints / logging). ``reason`` is ``None`` when this
+    path does not apply (e.g. datetime already aware).
+    """
+    if naive_dt.tzinfo is not None:
+        return naive_dt, None, None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return naive_dt, None, "invalid GPS coordinates"
+    tf = _timezone_finder_instance()
+    if tf is None:
+        return naive_dt, None, "no timezonefinder"
+    try:
+        name = tf.timezone_at(lat=lat, lng=lon)
+    except Exception:
+        return naive_dt, None, "timezonefinder error"
+    if not name:
+        return naive_dt, None, "no IANA zone"
+    zi = _zoneinfo_by_name(name)
+    if zi is None:
+        return naive_dt, None, "zone data missing (tzdata)"
+    try:
+        return naive_dt.replace(tzinfo=zi), name, None
+    except Exception:
+        return naive_dt, None, "invalid civil time in zone"
+
+
+def filesystem_instant_for_rule(
+    new_created: datetime,
+    rule_kind: str,
+    exif_best: datetime | None,
+    gps_iana: str | None,
+) -> datetime:
+    """
+    Rules often emit **naive** wall times (filename digits, stripped EXIF). For
+    ``filename_earlier_than_metadata`` / ``exif_earlier_than_metadata``, attach the capture
+    timezone from EXIF (offset tags) or GPS IANA so :meth:`datetime.timestamp` and Windows
+    file times encode the **same UTC instant** as metadata, not “those digits in the PC's zone.”
+    """
+    if new_created.tzinfo is not None:
+        return new_created
+    if rule_kind not in ("filename_earlier_than_metadata", "exif_earlier_than_metadata"):
+        return new_created
+    if exif_best is not None and exif_best.tzinfo is not None:
+        return new_created.replace(tzinfo=exif_best.tzinfo)
+    if gps_iana:
+        zi = _zoneinfo_by_name(gps_iana)
+        if zi is not None:
+            return new_created.replace(tzinfo=zi)
+    return new_created
 
 
 def safe_datetime(
@@ -91,70 +224,48 @@ def filename_ambiguous_vs_modified(dt: datetime, modified: datetime) -> bool:
     return abs(dt - modified) <= TZ_NAIVE_VS_MODIFIED_EQUIV_MAX
 
 
-def has_two_correlated_file_indicators(
-    *,
+def exif_civil_clock_for_stem_compare(exif: datetime) -> datetime:
+    """
+    Naive civil time to compare against camera filename digits (IMG_YYYYMMDD_HHMMSS, etc.).
+
+    EXIF DateTimeOriginal plus OffsetTimeOriginal describes **local wall time in the capture
+    offset**, the same convention as typical camera stems. For that case, compare those calendar
+    components to the parsed filename — **not** ``naive_local`` (host OS timezone), which would
+    falsely separate e.g. stem ``...140000`` from EXIF ``14:00:00+08:00`` on a machine in UTC.
+
+    If ``exif`` is naive (no offset tag), return it unchanged.
+
+    If ``exif`` is timezone-aware, return the same clock fields with ``tzinfo`` stripped (civil
+    time as recorded). This does not resolve XMP ``Z`` vs local-stem ambiguity; offset tags align
+    EXIF with stem when both follow EXIF 2.31 semantics.
+    """
+    if exif.tzinfo is not None:
+        return exif.replace(tzinfo=None)
+    return exif
+
+
+def exif_correlates_with_clock_filename(
+    exif: datetime,
     fn_entries: list[tuple[datetime, bool]],
-    exif_original: datetime | None,
-    modified: datetime,
-    now: datetime,
-    cfg: HeuristicConfig,
 ) -> bool:
     """
-    Return True when at least two capture indicators on the file corroborate each other.
+    True when EXIF and a clock-bearing filename time differ by at most
+    ``EXIF_VS_FILENAME_CLOCK_MAX_DELTA`` but are not identical.
 
-    Indicators considered:
-    - mtime
-    - earliest parsed filename datetime (if any, plausible)
-    - EXIF DateTimeOriginal (if any, plausible)
+    Pass **EXIF as read from metadata** (may be timezone-aware). Comparison uses
+    :func:`exif_civil_clock_for_stem_compare` so aware EXIF is not converted to the process
+    timezone before measuring distance to filename parses.
 
-    Corroboration is defined as being within ±1 day (or equal).
+    Within this narrow window, ``exif_earlier_than_metadata`` alone is misleading (sub-minute
+    skew between stem and EXIF); the filename branch should pick the embedded name time instead.
     """
-    cands: list[datetime] = [modified]
-
-    fn_plaus = [d for d, _inc in fn_entries if is_plausible_capture_date(d, now, cfg)]
-    if fn_plaus:
-        cands.append(min(fn_plaus))
-
-    if exif_original is not None and is_plausible_capture_date(exif_original, now, cfg):
-        cands.append(exif_original)
-
-    for i in range(len(cands)):
-        for j in range(i + 1, len(cands)):
-            if abs(cands[i] - cands[j]) <= TZ_NAIVE_VS_MODIFIED_EQUIV_MAX:
-                return True
+    exif_wall = exif_civil_clock_for_stem_compare(exif)
+    for fn_dt, inc in fn_entries:
+        if not inc:
+            continue
+        fn_dt = naive_local(fn_dt)
+        if exif_wall == fn_dt:
+            continue
+        if abs(exif_wall - fn_dt) <= EXIF_VS_FILENAME_CLOCK_MAX_DELTA:
+            return True
     return False
-
-
-def best_capture_time_for_folder_vs_metadata(
-    *,
-    fn_entries: list[tuple[datetime, bool]],
-    exif_original: datetime | None,
-    modified: datetime,
-    now: datetime,
-    cfg: HeuristicConfig,
-) -> datetime:
-    """
-    Pick a single timestamp for comparing against folder dating.
-
-    Prefer timezone-naive capture signals (filename, EXIF) when they are plausible and not
-    ambiguous vs mtime (±1 day). When multiple capture signals exist, use the earliest.
-
-    Falls back to mtime when no reliable capture signal exists.
-    """
-    cands: list[datetime] = []
-
-    for d, inc in fn_entries:
-        if not is_plausible_capture_date(d, now, cfg):
-            continue
-        if inc and filename_ambiguous_vs_modified(d, modified):
-            continue
-        cands.append(d)
-
-    if (
-        exif_original is not None
-        and is_plausible_capture_date(exif_original, now, cfg)
-        and not exif_ambiguous_vs_modified(exif_original, modified)
-    ):
-        cands.append(exif_original)
-
-    return min(cands) if cands else modified

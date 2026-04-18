@@ -21,6 +21,8 @@ from .cli import main
 from .datetime_policy import (
     TZ_NAIVE_VS_MODIFIED_EQUIV_MAX,
     exif_ambiguous_vs_modified,
+    filesystem_instant_for_rule,
+    infer_timezone_name_from_gps,
     naive_local,
 )
 from .dedupe import migrate_state_slot_keys, normalize_slot_key_for_dedupe, slot_key_for
@@ -28,6 +30,7 @@ from .extractors import (
     extract_filename_datetime_entries,
     match_structured_path,
     parse_path_calendar,
+    path_calendar_divergence_hint,
     path_has_calendar_hint,
     path_implies_date_period,
     read_exif_capture,
@@ -87,9 +90,11 @@ __all__ = [
     "default_state",
     "dest_path_from_slot_relative",
     "extract_filename_datetime_entries",
+    "filesystem_instant_for_rule",
     "file_times",
     "filename_has_anchor",
     "is_prior_organizer_output",
+    "infer_timezone_name_from_gps",
     "iter_media_files",
     "load_state_file",
     "main",
@@ -99,6 +104,7 @@ __all__ = [
     "normalize_skip_path_arg",
     "normalize_slot_key_for_dedupe",
     "parse_path_calendar",
+    "path_calendar_divergence_hint",
     "path_has_calendar_hint",
     "path_implies_date_period",
     "primary_time_action",

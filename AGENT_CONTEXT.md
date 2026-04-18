@@ -35,6 +35,8 @@ python src/__tests__/run_organize_photos_tests.py
 - **Python 3.10+**, **Windows** for CreationTime behavior (`ctypes` `SetFileTime`, PowerShell fallback). Env: **`ORGANIZE_USE_POWERSHELL_CREATION_TIME=1`** forces PowerShell-only path for setting creation time.
 - **Source is read-only**: no moves, no timestamp edits on originals.
 - **Optional Pillow**: EXIF `DateTimeOriginal` and PNG/text/XMP fallbacks via `_try_exif_datetime_original`.
+- **EXIF offsets**: `parse_exif_offset_string` accepts `±HH:MM` (including half-hour zones), compact `±HHMM`, and `Z` / `UTC`. When GPS is used to infer IANA time but `ZoneInfo` or **timezonefinder** fails, verbose hints include **`GPS~no_tz=…`** (reason string), not a silent fallback.
+- **Copy timestamps**: For `filename_earlier_than_metadata` / `exif_earlier_than_metadata`, `filesystem_instant_for_rule` attaches EXIF’s offset (or GPS IANA) to naive rule output so `.timestamp()` / Windows file times encode the **same UTC instant** as capture metadata, not “stem digits in the PC’s zone.” PowerShell CreationTime fallback uses Unix milliseconds for the same instant.
 - **Year folder** for output: derived from the chosen “capture” time (`final_created` / archive year), not only from filename in isolation.
 
 ---
@@ -42,14 +44,13 @@ python src/__tests__/run_organize_photos_tests.py
 ## 3. Dating pipeline (high level)
 
 1. **Per file**, read `created` / `modified` (Windows: “creation” vs last write as exposed by the script), optional **EXIF** datetime.
-2. **`rel_parts_for_path_dating`**: directory segments used for path calendar rules — may use `relative_to(source)` or, when the tree has no calendar hint, `relative_to(source.parent)` so a **dated leaf** as `--source` (e.g. `…/1994-Aug/file.jpg`) still contributes folder context.
+2. **`rel_parts_for_path_dating`**: directory segments used for **logging** (path-vs-resolved divergence hints) — may use `relative_to(source)` or, when the tree has no calendar hint, `relative_to(source.parent)` so a **dated leaf** as `--source` (e.g. `…/1994-Aug/file.jpg`) still contributes folder context. Folder layout does **not** change dating rules or dedupe scores.
 3. **`decide_actions(...)`** returns a list of **`Action`** objects; the **last** action with `new_created` wins for setting time (see `primary_time_action`). Rules are ordered; early returns are intentional.
 
 Rough order inside **`decide_actions`** (simplified):
 
 | Step | Idea |
 |------|------|
-| Path hierarchy (non–Apple-library shapes) | If folders imply a date **period** and the file lacks strong corroborating signals, may set `path_hierarchy_trusted` (end of period) and return. |
 | EXIF earlier than `min(created, modified)` | `exif_earlier_than_metadata` if not “ambiguous vs mtime” (±1 day logic). |
 | Filename datetime **earlier** than that minimum | `filename_earlier_than_metadata` with `filename_includes_time_in_name` when pattern had a clock. TZ-ish ambiguity: filename clock within ±1 day of mtime can suppress filename override. |
 | Various **`fallback_created_from_modified`** paths | When EXIF/filename are ambiguous vs mtime but mtime is consistent with capture signals, or `modified < created` with weak hints. |
@@ -57,6 +58,8 @@ Rough order inside **`decide_actions`** (simplified):
 | Last resort | `fallback_created_from_modified` if no useful filename/path hints and `modified < created`. |
 
 Constants like **`_TZ_NAIVE_VS_MODIFIED_EQUIV_MAX`** (and friends) define “same instant” windows between naive EXIF/filename and mtime.
+
+After a run, the CLI may log a **Path calendar review hint** when dated folders imply a period that does not contain the resolved time (see `path_calendar_divergence_hint` in `extractors.py`). This is advisory only.
 
 **Invalid folder dates** (e.g. `2024/02/31`): `path_implies_date_period` returns `None`; `path_has_calendar_hint` is false, so bad paths **do not** block fallback behavior.
 
@@ -87,7 +90,6 @@ Approximate scale (see source for exact strings):
 
 | Situation | Score (typical) |
 |-----------|-----------------|
-| `path_hierarchy_trusted` | 105 |
 | `exif_earlier_than_metadata` | 100 |
 | `structured_path_align_created` | 90 |
 | `filename_earlier_than_metadata` with clock + anchor | 94 |
@@ -95,7 +97,6 @@ Approximate scale (see source for exact strings):
 | date-only + anchor | 85 |
 | date-only | 75 |
 | `structured_path_oldest_signal` | 55 |
-| `path_calendar_recovery` (legacy) | 60 |
 | `fallback_created_from_modified` | 40 |
 | No time change / move only | 30 |
 

@@ -10,6 +10,8 @@ from pathlib import Path
 from .datetime_policy import (
     attach_exif_offset_if_any,
     is_plausible_capture_date,
+    naive_exif_with_gps_local_timezone,
+    naive_local,
     safe_datetime,
 )
 from .models import ExifCaptureInfo, HeuristicConfig
@@ -62,13 +64,77 @@ def _decode_exif_ascii_tag(v: object) -> str | None:
     return s if s else None
 
 
+def _ratio_to_float(v: object) -> float:
+    if isinstance(v, (tuple, list)) and len(v) >= 2:
+        try:
+            a, b = float(v[0]), float(v[1])
+            return a / b if b else a
+        except Exception:
+            pass
+    try:
+        return float(v)  # IFDRational
+    except Exception:
+        return 0.0
+
+
+def _gps_dms_tuple_to_degrees(parts: object, ref: object | None, *, is_latitude: bool) -> float | None:
+    if not isinstance(parts, (tuple, list)) or len(parts) < 3:
+        return None
+    d = _ratio_to_float(parts[0])
+    m = _ratio_to_float(parts[1])
+    s = _ratio_to_float(parts[2])
+    deg = d + m / 60.0 + s / 3600.0
+    r = ref
+    if isinstance(r, (bytes, bytearray)):
+        r = r.decode("ascii", "replace").strip().upper()
+    elif r is not None:
+        r = str(r).strip().upper()
+    else:
+        r = ""
+    if is_latitude:
+        if r.startswith("S"):
+            deg = -deg
+    else:
+        if r.startswith("W"):
+            deg = -deg
+    return deg
+
+
+def _gps_ifd_to_lat_lon(gps_ifd: dict[int, object]) -> tuple[float, float] | None:
+    lat_tup = gps_ifd.get(2)
+    lon_tup = gps_ifd.get(4)
+    if lat_tup is None or lon_tup is None:
+        return None
+    try:
+        lat = _gps_dms_tuple_to_degrees(lat_tup, gps_ifd.get(1), is_latitude=True)
+        lon = _gps_dms_tuple_to_degrees(lon_tup, gps_ifd.get(3), is_latitude=False)
+    except Exception:
+        return None
+    if lat is None or lon is None:
+        return None
+    return (lat, lon)
+
+
+def _parse_exif_gps_lat_lon(exif: object) -> tuple[float, float] | None:
+    try:
+        gps = exif.get_ifd(0x8825)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not gps:
+        return None
+    return _gps_ifd_to_lat_lon(gps)
+
+
 def read_exif_capture(path: Path) -> ExifCaptureInfo:
     """
-    Return best capture datetime from embedded metadata plus EXIF 2.31 offset tags and GPS presence.
+    Return best capture datetime from embedded metadata plus EXIF 2.31 offset tags and GPS.
 
     - DateTimeOriginal (0x9003) + OffsetTimeOriginal (0x9011) when present → timezone-aware datetime.
-    - GPS IFD (0x8825) non-empty → ``has_gps`` (location may refine TZ in future tooling).
-    - PNG: PNG text / XMP paths unchanged (no EXIF offset in most exports).
+    - If no offset tags but GPS lat/lon parse → IANA zone via ``timezonefinder`` (offline), then
+      treat naive EXIF clock as local civil time in that zone (``gps_timezone_name`` in hints).
+      If that fails, ``gps_tz_skip`` / ``GPS~no_tz=…`` explains why (e.g. missing ``tzdata``).
+    - GPS IFD (0x8825) non-empty → ``has_gps`` (``GPS=yes`` in verbose when no inferred tz line).
+    - PNG: PNG text / XMP paths unchanged (no EXIF offset / GPS in most exports).
     """
     try:
         from PIL import Image
@@ -167,6 +233,8 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
     except Exception:
         has_gps = False
 
+    gps_ll = _parse_exif_gps_lat_lon(exif)
+
     try:
         ifd = exif.get_ifd(0x8769)
     except Exception:
@@ -176,11 +244,26 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
     off_d = _decode_exif_ascii_tag(ifd.get(0x9012))
     off_main = _decode_exif_ascii_tag(exif.get(0x9010))
 
+    gps_tz_used: str | None = None
+    gps_tz_skip: str | None = None
+
     def _combine(raw: str, offset: str | None) -> datetime | None:
+        nonlocal gps_tz_used, gps_tz_skip
+        gps_tz_used = None
+        gps_tz_skip = None
         naive = _parse_exif_naive_datetime(raw)
         if naive is None:
             return None
-        return attach_exif_offset_if_any(naive, offset)
+        dt = attach_exif_offset_if_any(naive, offset)
+        if dt.tzinfo is None and gps_ll is not None:
+            lat, lon = gps_ll
+            dt2, zn, sk = naive_exif_with_gps_local_timezone(dt, lat, lon)
+            if zn:
+                gps_tz_used = zn
+            elif sk:
+                gps_tz_skip = sk
+            dt = dt2
+        return dt
 
     v9003 = ifd.get(0x9003)
     if isinstance(v9003, str):
@@ -191,6 +274,8 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
                 offset_time_original=off_o,
                 offset_time_digitized=off_d,
                 has_gps=has_gps,
+                gps_timezone_name=gps_tz_used,
+                gps_tz_skip=gps_tz_skip,
             )
 
     v9004 = ifd.get(0x9004)
@@ -202,6 +287,8 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
                 offset_time_original=off_o,
                 offset_time_digitized=off_d,
                 has_gps=has_gps,
+                gps_timezone_name=gps_tz_used,
+                gps_tz_skip=gps_tz_skip,
             )
 
     candidates: list[str] = []
@@ -231,6 +318,8 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
                 offset_time_original=off_o,
                 offset_time_digitized=off_d,
                 has_gps=has_gps,
+                gps_timezone_name=gps_tz_used,
+                gps_tz_skip=gps_tz_skip,
             )
     return ExifCaptureInfo(None, has_gps=has_gps)
 
@@ -641,34 +730,6 @@ def match_structured_path(parts: list[str]) -> datetime | None:
     return dt
 
 
-def is_apple_library_structured_path(parts: list[str]) -> bool:
-    """
-    Apple / Photos export: YYYY/MM/DD/<yyyymmdd-HHMMss>/file.
-    EXIF may be more reliable than these folder names; do not apply path_hierarchy_trusted.
-    """
-    return match_structured_path(parts) is not None
-
-
-def path_implies_date_for_recovery(
-    parts: list[str],
-) -> datetime | None:
-    """
-    For rule: path has year (or more) that we trust when metadata is newer.
-    Use end of period: Y -> end of year; Y/M -> end of month; Y/M/D -> end of day.
-    """
-    y, mo, da = parse_path_calendar(parts)
-    if y is None:
-        return None
-    if mo is None:
-        return datetime(y, 12, 31, 23, 59, 59)
-    if da is None:
-        last = _last_day_of_month(y, mo)
-        return datetime(y, mo, last, 23, 59, 59)
-    if not safe_datetime(y, mo, da):
-        return None
-    return datetime(y, mo, da, 23, 59, 59)
-
-
 def path_has_calendar_hint(parts: list[str]) -> bool:
     return path_implies_date_period(parts) is not None
 
@@ -700,6 +761,33 @@ def path_implies_date_period(
     start = datetime(y, mo, da, 0, 0, 0)
     end = datetime(y, mo, da, 23, 59, 59)
     return start, end
+
+
+def path_calendar_divergence_hint(
+    rel_parts: list[str],
+    resolved: datetime,
+    now: datetime,
+    cfg: HeuristicConfig,
+) -> str | None:
+    """
+    If directory segments imply a calendar period and the resolved capture time falls
+    outside that period, return a short note for post-run logging only (no effect on rules
+    or dedupe scoring).
+    """
+    period = path_implies_date_period(rel_parts)
+    if period is None:
+        return None
+    start, end = period
+    if not is_plausible_capture_date(end, now, cfg):
+        return None
+    # Compare folder-implied periods to capture civil date (strip zone; do not map to host).
+    r = resolved.replace(tzinfo=None) if resolved.tzinfo else resolved
+    if start <= r <= end:
+        return None
+    return (
+        f"path folders {start.date()}..{end.date()} vs resolved "
+        f"{r.isoformat(sep=' ', timespec='seconds')}"
+    )
 
 
 def rel_parts_for_path_dating(file_path: Path, source: Path) -> list[str]:

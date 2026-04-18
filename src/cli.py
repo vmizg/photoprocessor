@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from .dedupe import migrate_state_slot_keys, slot_key_for
-from .extractors import read_exif_capture, rel_parts_for_path_dating
+from .datetime_policy import filesystem_instant_for_rule
+from .extractors import (
+    path_calendar_divergence_hint,
+    read_exif_capture,
+    rel_parts_for_path_dating,
+)
 from .io_ops import (
     DEFAULT_LOG_ARG_SENTINEL,
     append_backup_manifest,
@@ -40,7 +45,7 @@ from .models import (
     MYSTERY_INCUMBENT_SCORE,
     SUPERSEDED_SUBDIR,
 )
-from .rules import confidence_score, decide_actions
+from .rules import confidence_score, decide_actions, primary_time_action
 from .state_repo import (
     default_state,
     dt_iso,
@@ -61,8 +66,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=Path("source"),
         help=(
             'Folder to scan (default: "./source"). '
-            "If folders under --source lack a calendar year, dating may use the path "
-            "from --source's parent (so a dated leaf as --source still counts)."
+            "If folders under --source lack a calendar year, path segments for review hints "
+            "may use the path from --source's parent (so a dated leaf as --source still counts)."
         ),
     )
     ap.add_argument(
@@ -251,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
 
     processed = 0
     errors = 0
+    path_review_count = 0
+    path_review_samples: list[str] = []
     dest_res = dest.resolve()
     backup_root_res = Path(args.backup_dir).resolve() if args.backup_dir else None
 
@@ -354,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             modified=modified,
             exif_original=exif_dt,
             exif_capture_hint=exif_hint,
+            exif_gps_timezone_name=exif_cap.gps_timezone_name,
         )
 
         # --- Stage 2: decide ---
@@ -367,10 +375,27 @@ def main(argv: list[str] | None = None) -> int:
             cfg,
         )
 
+        primary = primary_time_action(planned)
+        fs_materialized: datetime | None = None
+        if primary is not None and primary.new_created is not None:
+            fs_materialized = filesystem_instant_for_rule(
+                primary.new_created,
+                primary.kind,
+                facts.exif_original,
+                facts.exif_gps_timezone_name,
+            )
+
         final_created = created
-        for a in planned:
-            if a.new_created is not None:
-                final_created = a.new_created
+        if primary is not None and primary.new_created is not None:
+            final_created = fs_materialized
+
+        pr_note = path_calendar_divergence_hint(
+            list(facts.rel_parts), final_created, now, cfg
+        )
+        if pr_note is not None:
+            path_review_count += 1
+            if len(path_review_samples) < 15:
+                path_review_samples.append(f"{rel.as_posix()}: {pr_note}")
 
         move_year = final_created.year
         score, rule_key = confidence_score(planned, fname)
@@ -435,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                             exif_original=exif_dt,
                             exif_capture_hint=exif_hint,
                             planned=planned,
+                            materialized_created=fs_materialized,
                             dest_text=dest_text,
                             outcome_text=outcome_text,
                         )
@@ -471,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
                             exif_original=exif_dt,
                             exif_capture_hint=exif_hint,
                             planned=planned,
+                            materialized_created=fs_materialized,
                             dest_text=dest_text,
                             outcome_text=outcome_text,
                         )
@@ -532,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
                 exif_original=exif_dt,
                 exif_capture_hint=exif_hint,
                 planned=planned,
+                materialized_created=fs_materialized,
                 dest_text=dest_text,
                 outcome_text=outcome_text,
             )
@@ -588,12 +616,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             year_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fpath, target)
-            chosen_dt: datetime | None = None
-            for a in planned:
-                if a.new_created is not None:
-                    chosen_dt = a.new_created
-                    set_creation_time_windows(target, a.new_created, dry_run=False)
-            if chosen_dt is None:
+            chosen_dt: datetime | None = fs_materialized
+            if chosen_dt is not None:
+                set_creation_time_windows(target, chosen_dt, dry_run=False)
+            else:
                 set_creation_time_windows(target, created, dry_run=False)
             if (not args.preserve_source_mtime) and chosen_dt is not None:
                 ts = chosen_dt.timestamp()
@@ -612,6 +638,7 @@ def main(argv: list[str] | None = None) -> int:
                 exif_original=exif_dt,
                 exif_capture_hint=exif_hint,
                 planned=planned,
+                materialized_created=fs_materialized,
                 dest_text=dest_text,
                 outcome_text=outcome_text,
             )
@@ -658,6 +685,20 @@ def main(argv: list[str] | None = None) -> int:
                     log.error("Could not remove partial copy %s: %s", target, ue)
 
         processed += 1
+
+    if path_review_count > 0:
+        review_msg = (
+            "Path calendar review hint: %s file(s) had folder paths implying a date period "
+            "that does not contain the resolved capture time — consider manual review. "
+            "Examples: %s"
+            % (
+                path_review_count,
+                "; ".join(path_review_samples) if path_review_samples else "(none)",
+            )
+        )
+        log.info(review_msg)
+        run_log.write(review_msg + "\n")
+        run_log.flush()
 
     log.info(
         "Done. processed=%s errors=%s dry_run=%s",
