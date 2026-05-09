@@ -1738,6 +1738,40 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
                     "windows slot normalization: expected duplicate skip for Unicode/case equivalent names"
                 )
 
+        # Re-run idempotency (no-op on second run without relying on state to decide duplicates):
+        # after a real run, rerunning with the same source+dest should not create extra copies
+        # (no _1 suffixes; no _superseded churn) when the canonical target already matches.
+        src_id = base / "src_idem"
+        dest_id = base / "dest_idem"
+        src_id.mkdir()
+        dest_id.mkdir()
+        write_dummy_photo(src_id / "one.jpg")
+        st_id = base / "st_id.json"
+        code_1, _out_1 = run_organizer(src_id, dest_id, False, st_id)
+        if code_1 != 0:
+            errors.append(f"idempotency first run exit {code_1}")
+        files_after_1 = sorted(
+            p.relative_to(dest_id).as_posix()
+            for p in dest_id.rglob("*")
+            if p.is_file()
+        )
+        code_2, _out_2 = run_organizer(src_id, dest_id, False, st_id)
+        if code_2 != 0:
+            errors.append(f"idempotency second run exit {code_2}")
+        files_after_2 = sorted(
+            p.relative_to(dest_id).as_posix()
+            for p in dest_id.rglob("*")
+            if p.is_file()
+        )
+        if files_after_1 != files_after_2:
+            errors.append(
+                "idempotency: dest contents changed on second run:\n"
+                f"after_1={files_after_1}\n"
+                f"after_2={files_after_2}"
+            )
+        if (dest_id / "_superseded").exists():
+            errors.append("idempotency: _superseded should not be created on exact rerun")
+
 
 def _configure_stdio() -> None:
     if hasattr(sys.stdout, "reconfigure"):

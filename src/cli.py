@@ -240,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
             "Optional --backup-dir keeps an extra copy of each source file elsewhere."
         )
 
+    # Dedupe scoring is always enabled (legacy collision suffix mode removed).
+    dedupe = True
+
     if args.state_file is not None:
         state_path_resolved: Path | None = args.state_file.resolve()
     else:
@@ -606,6 +609,39 @@ def main(argv: list[str] | None = None) -> int:
                 "winner": wrec,
                 "history": list(prev.get("history", [])),
             }
+            processed += 1
+            continue
+
+        # Pre-copy idempotency: if the canonical target already exists and matches the source
+        # on (size, CreationTime, mtime), do nothing. This makes re-running on the same
+        # source/dest a no-op for already-copied files, without needing state to decide it.
+        if target.is_file() and fp_res != target.resolve() and same_size_created_mtime(fpath, target):
+            rec_id = record_skip_identical(
+                source_relative=rel.as_posix(),
+                competing_target=slot_key_for(move_year, fname),
+                incumbent_source="<dest_already_present>",
+                sequence=seq,
+            )
+            state["skipped"].append(rec_id)
+            dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
+            outcome_text = "SKIP already present (same size, created, modified)"
+            if not args.silence_skipped:
+                emit_to_both(
+                    out_stream=out_stream,
+                    run_log=run_log,
+                    rel_posix=rel.as_posix(),
+                    created=created,
+                    modified=modified,
+                    exif_original=exif_dt,
+                    exif_capture_hint=exif_hint,
+                    planned=planned,
+                    materialized_created=fs_materialized,
+                    dest_text=dest_text,
+                    outcome_text=outcome_text,
+                )
+            log.info("Skip copy: identical to existing dest %s", target)
+            if effective_state_path:
+                save_state_atomic(effective_state_path, state)
             processed += 1
             continue
 
