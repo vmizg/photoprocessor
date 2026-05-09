@@ -122,6 +122,14 @@ def main() -> int:
         action="store_true",
         help="Also scan media files and compute decide_actions patterns.",
     )
+    ap.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        metavar="YYYY",
+        help="Same as organize_photos --year: enable structured path slug dating only when "
+        "the slug year matches (pass None by omitting flag).",
+    )
     args = ap.parse_args()
 
     root: Path = args.root
@@ -215,6 +223,7 @@ def main() -> int:
                 now,
                 cfg,
                 exif_gps_timezone_name=exif_cap.gps_timezone_name,
+                path_anchor_year=args.year,
             )
             primary = op.primary_time_action(planned)
             primary_kind = primary.kind if primary is not None else "move_only_no_time_change"

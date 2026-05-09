@@ -114,9 +114,9 @@ def build_source_tree(root: Path) -> None:
 # Hardcoded expectations (aligned with src.organize_photos behavior)
 #
 # - `expected_rule_tags`: bracket kinds printed for that file, in order.
-#   Use () for "no dating rule" (move-only / dry-run copy only).
+#   Use () for "no dating rule" (no primary time action / score 30).
 # - `must_contain`: substrings that must appear in that file's verbose block.
-# - `must_not_contain`: optional guardrails (e.g. move-only must not claim filename rule).
+# - `must_not_contain`: optional guardrails (e.g. plain file must not claim filename rule).
 # - `source_created_before_note` / `dest_copy_created_after_note`: alignment on what the
 #   script considers "before" (source ctime in verbose) vs "after" (copy CreationTime).
 # - `dest_creation_time_touched`: True when `-> copy would get CreationTime` appears (PowerShell
@@ -154,7 +154,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "dest=by-year/{current_year}/solo.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Dated folder alone does not set CreationTime; move-only without other signals.",
+        dest_copy_created_after_note="Dated folder alone does not set CreationTime without filename/EXIF/mtime rule.",
         dest_creation_time_touched=False,
         dest_copy_creation_after_iso=None,
         touch_outcome="untouched_same_as_source",
@@ -196,7 +196,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "dest=by-year/{current_year}/scan.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Dated folders do not set CreationTime; move-only without EXIF/filename/mtime rule.",
+        dest_copy_created_after_note="Dated folders do not set CreationTime without EXIF/filename/mtime rule.",
         dest_creation_time_touched=False,
         dest_copy_creation_after_iso=None,
         touch_outcome="untouched_same_as_source",
@@ -209,7 +209,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "dest=by-year/{current_year}/eu.jpg",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="Dated folders do not set CreationTime; move-only without other signals.",
+        dest_copy_created_after_note="Dated folders do not set CreationTime without other signals.",
         dest_creation_time_touched=False,
         dest_copy_creation_after_iso=None,
         touch_outcome="untouched_same_as_source",
@@ -229,16 +229,16 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
     ),
     FileExpectation(
         "2020/01/15/20200115-120000/mismatch.jpg",
-        ("structured_path_oldest_signal",),
+        ("fallback_created_from_modified",),
         (
-            "structured_path_oldest_signal",
+            "fallback_created_from_modified",
             "set_created=2010-06-01 08:00:00",
             "DRY-RUN would copy",
             "dest=by-year/2010/mismatch.jpg",
         ),
         must_not_contain=(),
-        source_created_before_note="created= ~ test run; modified= forced to 2010-06-01 (slug vs mtime mismatch).",
-        dest_copy_created_after_note="Oldest of path slug, created, modified wins -> 2010-06-01 08:00:00 (mtime).",
+        source_created_before_note="created= ~ test run; modified= forced to 2010-06-01 (structured path off without --year).",
+        dest_copy_created_after_note="Folder slug ignored unless --year matches slug year; mtime wins via fallback.",
         dest_creation_time_touched=True,
         dest_copy_creation_after_iso="2010-06-01 08:00:00",
         touch_outcome="touched",
@@ -312,7 +312,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
             "[exif_earlier_than_metadata]",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="No new_created; copy keeps source CreationTime (move-only / score 30).",
+        dest_copy_created_after_note="No new_created; copy keeps source CreationTime (score 30).",
         dest_creation_time_touched=False,
         dest_copy_creation_after_iso=None,
         touch_outcome="untouched_same_as_source",
@@ -684,32 +684,6 @@ def run_skip_path_cli_smoke_test(errors: list[str]) -> None:
             errors.append(
                 "skip-path smoke: skipped file should not appear in organizer output"
             )
-
-
-def run_move_only_flag_smoke_test(errors: list[str]) -> None:
-    """--move-only skips dating rules; filename clock in stem must not set copy time."""
-    with tempfile.TemporaryDirectory(prefix="organize_move_only_") as tmp:
-        root = Path(tmp) / "src"
-        dest = Path(tmp) / "out"
-        state = Path(tmp) / "state.json"
-        write_dummy_photo(root / "filename_clock" / "IMG_20100615_143022.jpg")
-        code, out = run_organizer(root, dest, True, state, extra_args=["--move-only"])
-        if code != 0:
-            errors.append(f"--move-only smoke exit {code}")
-        if "Done. Files processed: 1." not in out:
-            errors.append(f"--move-only: expected 1 file processed\n{out[-1200:]}")
-        block = _paragraph_for_rel(out, "filename_clock/IMG_20100615_143022.jpg")
-        if block is None:
-            errors.append("--move-only: missing verbose paragraph for IMG file")
-        else:
-            if "rule=move_only_no_time_change" not in block:
-                errors.append(
-                    f"--move-only: expected rule=move_only_no_time_change\n{block}"
-                )
-            if "set_created=2010-06-15" in block:
-                errors.append(
-                    "--move-only: must not apply filename clock (2010) to set_created"
-                )
 
 
 def run_organize_photos_import_library_tests(errors: list[str]) -> None:
@@ -1384,11 +1358,62 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         mod_a = slug_dt
         cre_a = slug_dt + timedelta(hours=1)
         acts_ap = op.decide_actions(
-            apple_parts, "x.jpg", cre_a, mod_a, None, now, cfg
+            apple_parts,
+            "x.jpg",
+            cre_a,
+            mod_a,
+            None,
+            now,
+            cfg,
+            path_anchor_year=2020,
         )
         kinds_ap = [a.kind for a in acts_ap]
         if kinds_ap != ["structured_path_align_created"]:
             errors.append(f"expected structured_path_align_created, got {kinds_ap}")
+
+        acts_ap_wrong_year = op.decide_actions(
+            apple_parts,
+            "x.jpg",
+            cre_a,
+            mod_a,
+            None,
+            now,
+            cfg,
+            path_anchor_year=2019,
+        )
+        if not any(
+            a.kind == "fallback_created_from_modified" for a in acts_ap_wrong_year
+        ):
+            errors.append(
+                "path_anchor_year mismatch: expected fallback_created_from_modified "
+                f"when slug year != anchor, got {[a.kind for a in acts_ap_wrong_year]}"
+            )
+        if any(
+            a.kind.startswith("structured_path") for a in acts_ap_wrong_year
+        ):
+            errors.append(
+                "path_anchor_year mismatch: must not emit structured_path rules "
+                f"when slug year != --year, got {[a.kind for a in acts_ap_wrong_year]}"
+            )
+
+        # Structured path + matching --year restores slug vs mtime conflict behavior.
+        sp = ["2020", "01", "15", "20200115-120000"]
+        cre_m = datetime(2026, 1, 1, 12, 0, 0)
+        mod_m = datetime(2010, 6, 1, 8, 0, 0)
+        acts_slug = op.decide_actions(
+            sp,
+            "mismatch.jpg",
+            cre_m,
+            mod_m,
+            None,
+            now,
+            cfg,
+            path_anchor_year=2020,
+        )
+        if not any(a.kind == "structured_path_oldest_signal" for a in acts_slug):
+            errors.append(
+                f"expected structured_path_oldest_signal with --year 2020, got {[a.kind for a in acts_slug]}"
+            )
 
         # --- decide_actions: fallback_created_from_modified ---
         acts_fb = op.decide_actions(
@@ -1419,7 +1444,7 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         # --- confidence_score / primary_time_action / filename_has_anchor ---
         sc, rk = op.confidence_score([], "a.jpg")
         if sc != 30 or rk != "move_only_no_time_change":
-            errors.append(f"confidence move-only: {(sc,rk)}")
+            errors.append(f"confidence empty planned (score 30): {(sc,rk)}")
         exif_leg = [
             op.Action(
                 "exif_earlier_than_metadata",
@@ -1876,14 +1901,6 @@ def main() -> int:
 
     print("\n=== --skip-path CLI smoke ===\n")
     run_skip_path_cli_smoke_test(errors)
-    if errors:
-        print("\nFAILED:", file=sys.stderr)
-        for e in errors:
-            print(f"  - {e}", file=sys.stderr)
-        return 1
-
-    print("\n=== --move-only CLI smoke ===\n")
-    run_move_only_flag_smoke_test(errors)
     if errors:
         print("\nFAILED:", file=sys.stderr)
         for e in errors:

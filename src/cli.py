@@ -34,10 +34,9 @@ from .io_ops import (
     record_skip_identical,
     record_winner,
     resolve_log_path_arg,
-    same_size_created_mtime,
+    files_identical_bytes,
     set_creation_time_windows,
     setup_logging,
-    unique_dest,
     unique_superseded_name,
 )
 from .models import (
@@ -123,6 +122,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Ignore EXIF/filename dates after this year (default: 2100).",
     )
     ap.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        metavar="YYYY",
+        help="Optional batch hint: use structured folder slug dating only when the slug year "
+        "matches YYYY (pattern …/YYYY/MM/DD/yyyymmdd-HHMMss/… under --source). "
+        "If omitted, folder layout is not used for capture dating. "
+        "Path calendar review hints are emitted only when --year is set.",
+    )
+    ap.add_argument(
         "--fallback-timezone",
         type=normalize_iana_timezone_name,
         default=None,
@@ -164,13 +173,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "it matches any pattern. Example: --include-glob \"**/*.mp4\" --include-glob \"**/*.mov\"",
     )
     ap.add_argument(
-        "--move-only",
-        action="store_true",
-        help="Skip EXIF/filename/path dating rules: place files under <dest>/<YEAR>/ using only "
-        "the source file's filesystem CreationTime (same as move_only_no_time_change). "
-        "The copy still gets CreationTime set to match the source; mtime stays as copied from source.",
-    )
-    ap.add_argument(
         "--preserve-source-mtime",
         action="store_true",
         help="Keep the destination file's modified time (mtime) as the source mtime (copy2 default). "
@@ -210,6 +212,15 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = HeuristicConfig(min_year=args.min_year, max_year=args.max_year)
     now = datetime.now()
+
+    if args.year is not None and (
+        args.year < args.min_year or args.year > args.max_year
+    ):
+        print(
+            f"ERROR: --year {args.year} is outside --min-year/--max-year bounds.",
+            file=sys.stderr,
+        )
+        return 2
 
     log_path: Path = args.log
     log = setup_logging(log_path, args.verbose)
@@ -299,9 +310,11 @@ def main(argv: list[str] | None = None) -> int:
             "Including only paths (relative to --source) matching: %s",
             ", ".join(include_globs),
         )
-    if args.move_only:
+    if args.year is not None:
         log.info(
-            "Move-only mode: skipping dating heuristics; archive year from source CreationTime only."
+            "Structured path slug dating enabled for slug year %s only; "
+            "path calendar review hints enabled.",
+            args.year,
         )
 
     if args.sort_files:
@@ -389,19 +402,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # --- Stage 2: decide ---
-        if args.move_only:
-            planned = []
-        else:
-            planned = decide_actions(
-                list(facts.rel_parts),
-                facts.filename,
-                facts.created,
-                facts.modified,
-                facts.exif_original,
-                now,
-                cfg,
-                exif_gps_timezone_name=facts.exif_gps_timezone_name,
-            )
+        planned = decide_actions(
+            list(facts.rel_parts),
+            facts.filename,
+            facts.created,
+            facts.modified,
+            facts.exif_original,
+            now,
+            cfg,
+            exif_gps_timezone_name=facts.exif_gps_timezone_name,
+            path_anchor_year=args.year,
+        )
 
         primary = primary_time_action(planned)
         fs_materialized: datetime | None = None
@@ -418,13 +429,14 @@ def main(argv: list[str] | None = None) -> int:
         if primary is not None and primary.new_created is not None:
             final_created = fs_materialized
 
-        pr_note = path_calendar_divergence_hint(
-            list(facts.rel_parts), final_created, now, cfg
-        )
-        if pr_note is not None:
-            path_review_count += 1
-            if len(path_review_samples) < 15:
-                path_review_samples.append(f"{rel.as_posix()}: {pr_note}")
+        if args.year is not None:
+            pr_note = path_calendar_divergence_hint(
+                list(facts.rel_parts), final_created, now, cfg
+            )
+            if pr_note is not None:
+                path_review_count += 1
+                if len(path_review_samples) < 15:
+                    path_review_samples.append(f"{rel.as_posix()}: {pr_note}")
 
         move_year = final_created.year
         score, rule_key = confidence_score(planned, fname)
@@ -505,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
                 tr = str(w.get("target_relative", sk))
                 inc_path = dest_path_from_slot_relative(dest, tr)
                 if inc_path.is_file() and fp_res != inc_path.resolve():
-                    if same_size_created_mtime(fpath, inc_path):
+                    if files_identical_bytes(fpath, inc_path):
                         rec_id = record_skip_identical(
                             source_relative=rel.as_posix(),
                             competing_target=sk,
@@ -514,9 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         state["skipped"].append(rec_id)
                         dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
-                        outcome_text = (
-                            "SKIP identical dest (same size, created, modified)"
-                        )
+                        outcome_text = "SKIP identical dest (same file bytes)"
                         emit_to_both(
                             out_stream=out_stream,
                             run_log=run_log,
@@ -612,10 +622,11 @@ def main(argv: list[str] | None = None) -> int:
             processed += 1
             continue
 
-        # Pre-copy idempotency: if the canonical target already exists and matches the source
-        # on (size, CreationTime, mtime), do nothing. This makes re-running on the same
-        # source/dest a no-op for already-copied files, without needing state to decide it.
-        if target.is_file() and fp_res != target.resolve() and same_size_created_mtime(fpath, target):
+        # Pre-copy idempotency: if the canonical target already exists and is byte-identical
+        # to the source, do nothing (stronger than matching filesystem timestamps).
+        if target.is_file() and fp_res != target.resolve() and files_identical_bytes(
+            fpath, target
+        ):
             rec_id = record_skip_identical(
                 source_relative=rel.as_posix(),
                 competing_target=slot_key_for(move_year, fname),
@@ -624,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             state["skipped"].append(rec_id)
             dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
-            outcome_text = "SKIP already present (same size, created, modified)"
+            outcome_text = "SKIP already present (same file bytes)"
             if not args.silence_skipped:
                 emit_to_both(
                     out_stream=out_stream,

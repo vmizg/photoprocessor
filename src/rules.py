@@ -37,6 +37,7 @@ def decide_actions(
     cfg: HeuristicConfig,
     *,
     exif_gps_timezone_name: str | None = None,
+    path_anchor_year: int | None = None,
 ) -> list[Action]:
     actions: list[Action] = []
     # Host-local normalization for filesystem / plausibility; stem correlation uses raw EXIF
@@ -263,38 +264,38 @@ def decide_actions(
             )
             return actions
 
-    slug_dt = match_structured_path(rel_parts)
-
-    if slug_dt is not None:
-        delta = abs((modified - slug_dt).total_seconds())
-        if delta < 1.0:
-            if created > modified:
+    if path_anchor_year is not None:
+        slug_dt = match_structured_path(rel_parts)
+        if slug_dt is not None and slug_dt.year == path_anchor_year:
+            delta = abs((modified - slug_dt).total_seconds())
+            if delta < 1.0:
+                if created > modified:
+                    actions.append(
+                        Action(
+                            "structured_path_align_created",
+                            f"created {created} > modified {modified}; set created = modified",
+                            new_created=modified,
+                        )
+                    )
+                    return actions
+            else:
                 actions.append(
                     Action(
-                        "structured_path_align_created",
-                        f"created {created} > modified {modified}; set created = modified",
-                        new_created=modified,
+                        "structured_path_mismatch",
+                        f"path slug {slug_dt.isoformat(sep=' ')} vs mtime {modified} "
+                        f"(abs delta={delta:.1f}s) - not applying rule 2",
+                    )
+                )
+                oldest = min(slug_dt, created, modified)
+                actions.append(
+                    Action(
+                        "structured_path_oldest_signal",
+                        f"path slug vs mtime conflict; oldest of slug / created / modified -> "
+                        f"{oldest.isoformat(sep=' ')}",
+                        new_created=oldest,
                     )
                 )
                 return actions
-        else:
-            actions.append(
-                Action(
-                    "structured_path_mismatch",
-                    f"path slug {slug_dt.isoformat(sep=' ')} vs mtime {modified} "
-                    f"(abs delta={delta:.1f}s) - not applying rule 2",
-                )
-            )
-            oldest = min(slug_dt, created, modified)
-            actions.append(
-                Action(
-                    "structured_path_oldest_signal",
-                    f"path slug vs mtime conflict; oldest of slug / created / modified -> "
-                    f"{oldest.isoformat(sep=' ')}",
-                    new_created=oldest,
-                )
-            )
-            return actions
 
     if not fn_dates or filename_hint_suppressed_by_mtime or exif_hint_suppressed_by_mtime:
         if modified < created:
@@ -310,7 +311,13 @@ def decide_actions(
     return actions
 
 
-def decide(facts: FileFacts, now: datetime, cfg: HeuristicConfig) -> Decision:
+def decide(
+    facts: FileFacts,
+    now: datetime,
+    cfg: HeuristicConfig,
+    *,
+    path_anchor_year: int | None = None,
+) -> Decision:
     """Pure decision stage: ``collect facts → decide``."""
     planned = decide_actions(
         list(facts.rel_parts),
@@ -321,6 +328,7 @@ def decide(facts: FileFacts, now: datetime, cfg: HeuristicConfig) -> Decision:
         now,
         cfg,
         exif_gps_timezone_name=facts.exif_gps_timezone_name,
+        path_anchor_year=path_anchor_year,
     )
     return Decision.from_actions(planned)
 

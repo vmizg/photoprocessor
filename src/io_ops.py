@@ -46,6 +46,24 @@ def same_size_created_mtime(a: Path, b: Path) -> bool:
     )
 
 
+def files_identical_bytes(a: Path, b: Path) -> bool:
+    """True when both files exist, same size, and byte-for-byte equal."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+    except OSError:
+        return False
+    bufsize = 1024 * 1024
+    with a.open("rb") as f1, b.open("rb") as f2:
+        while True:
+            c1 = f1.read(bufsize)
+            c2 = f2.read(bufsize)
+            if c1 != c2:
+                return False
+            if not c1:
+                return True
+
+
 _FILETIME_EPOCH_1970 = 116444736000000000
 
 
