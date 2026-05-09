@@ -83,9 +83,13 @@ class ExifCaptureInfo:
     gps_timezone_name: str | None = None
     #: When GPS was present but IANA/zone data could not be applied (verbose hint only).
     gps_tz_skip: str | None = None
+    #: Where embedded capture time came from for video (e.g. ``ffprobe:creation_time``).
+    video_metadata_source: str | None = None
 
     def hint_string(self) -> str | None:
         parts: list[str] = []
+        if self.video_metadata_source:
+            parts.append(self.video_metadata_source)
         if self.offset_time_original:
             parts.append(f"OffsetTimeOriginal={self.offset_time_original}")
         if self.offset_time_digitized and not self.offset_time_original:

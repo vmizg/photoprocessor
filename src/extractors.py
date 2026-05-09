@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .datetime_policy import (
@@ -14,7 +17,7 @@ from .datetime_policy import (
     naive_local,
     safe_datetime,
 )
-from .models import ExifCaptureInfo, HeuristicConfig
+from .models import ExifCaptureInfo, HeuristicConfig, VIDEO_EXTENSIONS
 
 # Filename date patterns (tightened where noted)
 _RE_DATETIME_COMPACT = re.compile(
@@ -125,10 +128,245 @@ def _parse_exif_gps_lat_lon(exif: object) -> tuple[float, float] | None:
     return _gps_ifd_to_lat_lon(gps)
 
 
+_APPLE_MOVIE_EPOCH_UTC = datetime(1904, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+_MP4_CONTAINER_TAGS = frozenset(
+    {
+        b"moov",
+        b"trak",
+        b"mdia",
+        b"minf",
+        b"stbl",
+        b"edts",
+        b"udta",
+        b"meta",
+        b"ilst",
+        b"dinf",
+    }
+)
+
+
+def _apple_seconds_to_utc_aware(seconds: int) -> datetime | None:
+    """QuickTime ``mvhd`` / ``mdhd`` creation_time (seconds since 1904-01-01 UTC)."""
+    if seconds <= 0:
+        return None
+    try:
+        dt = _APPLE_MOVIE_EPOCH_UTC + timedelta(seconds=seconds)
+    except OverflowError:
+        return None
+    if not (1980 <= dt.year <= 2105):
+        return None
+    return dt
+
+
+def _parse_video_tag_datetime(s: str) -> datetime | None:
+    """Parse ``creation_time`` / container tags from ffprobe (Explorer “Media created” source)."""
+    t = s.strip()
+    if not t:
+        return None
+    if t.lower().startswith("utc "):
+        t = t[4:].strip()
+    if len(t) == 4 and t.isdigit():
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", t):
+        try:
+            return datetime(int(t[:4]), int(t[5:7]), int(t[8:10]), 0, 0, 0, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if t[-1:] in ("Z", "z") and "T" in t:
+        t = t[:-1] + "+00:00"
+    for cand in (t, t.replace("T", " ", 1)):
+        try:
+            return datetime.fromisoformat(cand)
+        except ValueError:
+            continue
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+    ):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _ffprobe_embedded_datetime(path: Path) -> tuple[datetime, str] | None:
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                exe,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        return None
+    try:
+        doc = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    def try_tags(tags: object, label: str) -> tuple[datetime, str] | None:
+        if not isinstance(tags, dict):
+            return None
+        for key in (
+            "creation_time",
+            "com.apple.quicktime.creationdate",
+            "date",
+            "DATE",
+            "creation_date",
+            "DATE_ENCODED",
+            "com.apple.quicktime.creationDate",
+        ):
+            if key not in tags:
+                continue
+            dt = _parse_video_tag_datetime(str(tags[key]))
+            if dt is not None:
+                return (dt, f"ffprobe:{label}.{key}")
+        for k, v in tags.items():
+            if str(k).lower() == "creation_time":
+                dt = _parse_video_tag_datetime(str(v))
+                if dt is not None:
+                    return (dt, f"ffprobe:{label}.{k}")
+        return None
+
+    fmt = doc.get("format")
+    if isinstance(fmt, dict):
+        got = try_tags(fmt.get("tags"), "format.tags")
+        if got is not None:
+            return got
+
+    for stream in doc.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        if stream.get("codec_type") != "video":
+            continue
+        got = try_tags(stream.get("tags"), "stream.video.tags")
+        if got is not None:
+            return got
+    return None
+
+
+def _mp4_read_atom_bounds(buf: bytes, pos: int, hard_end: int) -> tuple[int, bytes, int, int] | None:
+    if pos + 8 > hard_end:
+        return None
+    sz0 = int.from_bytes(buf[pos : pos + 4], "big")
+    tag = buf[pos + 4 : pos + 8]
+    if sz0 == 0:
+        sz = hard_end - pos
+        hlen = 8
+    elif sz0 == 1:
+        if pos + 16 > hard_end:
+            return None
+        sz = int.from_bytes(buf[pos + 8 : pos + 16], "big")
+        hlen = 16
+    else:
+        sz = sz0
+        hlen = 8
+    if sz < hlen:
+        return None
+    atom_end = pos + sz
+    if atom_end > hard_end:
+        return None
+    body_start = pos + hlen
+    return (atom_end, tag, body_start, atom_end)
+
+
+def _parse_mvhd_timescale_duration(buf: bytes, b0: int, b1: int) -> datetime | None:
+    if b0 >= b1 or b0 + 4 > b1:
+        return None
+    ver = buf[b0]
+    if ver == 0:
+        if b0 + 16 > b1:
+            return None
+        ct = int.from_bytes(buf[b0 + 12 : b0 + 16], "big")
+    elif ver == 1:
+        if b0 + 24 > b1:
+            return None
+        ct = int.from_bytes(buf[b0 + 12 : b0 + 20], "big")
+    else:
+        return None
+    return _apple_seconds_to_utc_aware(ct)
+
+
+def _walk_mp4_for_mvhd(buf: bytes, start: int, end: int) -> datetime | None:
+    pos = start
+    while pos + 8 <= end:
+        part = _mp4_read_atom_bounds(buf, pos, end)
+        if part is None:
+            break
+        atom_end, tag, b0, b1 = part
+        if tag == b"mvhd":
+            return _parse_mvhd_timescale_duration(buf, b0, b1)
+        if tag in _MP4_CONTAINER_TAGS:
+            got = _walk_mp4_for_mvhd(buf, b0, b1)
+            if got is not None:
+                return got
+        pos = atom_end
+    return None
+
+
+def _read_bytes_for_mp4_scan(path: Path) -> bytes | None:
+    try:
+        n = path.stat().st_size
+    except OSError:
+        return None
+    max_full = 96 * 1024 * 1024
+    try:
+        with path.open("rb") as f:
+            if n <= max_full:
+                return f.read()
+            head = f.read(8 * 1024 * 1024)
+            f.seek(max(0, n - 16 * 1024 * 1024))
+            tail = f.read()
+            return head + tail
+    except OSError:
+        return None
+
+
+def _mp4_mvhd_creation_utc(path: Path) -> datetime | None:
+    suf = path.suffix.lower()
+    if suf not in {".mp4", ".m4v", ".mov", ".3gp"}:
+        return None
+    buf = _read_bytes_for_mp4_scan(path)
+    if not buf:
+        return None
+    return _walk_mp4_for_mvhd(buf, 0, len(buf))
+
+
+def _video_embedded_capture_datetime(path: Path) -> tuple[datetime, str] | None:
+    got = _ffprobe_embedded_datetime(path)
+    if got is not None:
+        return got
+    mv = _mp4_mvhd_creation_utc(path)
+    if mv is not None:
+        return (mv, "mp4:mvhd.creation_time")
+    return None
+
+
 def read_exif_capture(path: Path) -> ExifCaptureInfo:
     """
     Return best capture datetime from embedded metadata plus EXIF 2.31 offset tags and GPS.
 
+    - **Video** (extensions in ``VIDEO_EXTENSIONS``): ``ffprobe`` format/stream tags such as
+      ``creation_time`` (often shown as “Media created”), then MP4/MOV ``mvhd`` time (Apple epoch)
+      if ``ffprobe`` is unavailable or has no usable tags.
     - DateTimeOriginal (0x9003) + OffsetTimeOriginal (0x9011) when present → timezone-aware datetime.
     - If no offset tags but GPS lat/lon parse → IANA zone via ``timezonefinder`` (offline), then
       treat naive EXIF clock as local civil time in that zone (``gps_timezone_name`` in hints).
@@ -136,6 +374,13 @@ def read_exif_capture(path: Path) -> ExifCaptureInfo:
     - GPS IFD (0x8825) non-empty → ``has_gps`` (``GPS=yes`` in verbose when no inferred tz line).
     - PNG: PNG text / XMP paths unchanged (no EXIF offset / GPS in most exports).
     """
+    suf = path.suffix.lower()
+    if suf in VIDEO_EXTENSIONS:
+        vm = _video_embedded_capture_datetime(path)
+        if vm is not None:
+            dt, src = vm
+            return ExifCaptureInfo(dt, video_metadata_source=src)
+
     try:
         from PIL import Image
         from PIL.ExifTags import TAGS

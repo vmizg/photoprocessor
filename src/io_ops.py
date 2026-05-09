@@ -224,6 +224,44 @@ def normalize_skip_path_arg(s: str) -> str:
     return str(PurePosixPath(*parts))
 
 
+def normalize_include_glob_arg(s: str) -> str:
+    """
+    Normalize ``--include-glob`` patterns: forward slashes, no ``..`` segments.
+    Glob metacharacters (``*``, ``?``, ``**``, ``[]``) are preserved.
+    """
+    t = s.strip().replace("\\", "/")
+    while t.startswith("/"):
+        t = t[1:]
+    t = t.strip()
+    if not t:
+        raise argparse.ArgumentTypeError("empty glob pattern")
+    for seg in PurePosixPath(t).parts:
+        if seg == "..":
+            raise argparse.ArgumentTypeError("--include-glob must not contain '..'")
+    return str(PurePosixPath(t))
+
+
+def _rel_matches_include_globs(rel_posix: str, patterns: tuple[str, ...]) -> bool:
+    """
+    True if ``rel_posix`` matches any glob (pathlib semantics, including ``**``).
+
+    pathlib does not treat ``**/*.ext`` as matching a top-level ``file.ext``; for patterns
+    of the form ``**/rest`` where ``rest`` has no further ``/``, we also try ``rest`` alone
+    so ``--include-glob \"**/*.mp4\"`` includes files directly under ``--source``.
+    """
+    if not patterns:
+        return True
+    rel = PurePosixPath(rel_posix)
+    for pat in patterns:
+        if rel.match(pat):
+            return True
+        if pat.startswith("**/"):
+            rest = pat[3:]
+            if "/" not in rest and rel.match(rest):
+                return True
+    return False
+
+
 def unique_superseded_name(dest: Path, stem: str, suffix: str) -> Path:
     sup = dest / SUPERSEDED_SUBDIR
     for n in range(10_000):
@@ -239,6 +277,7 @@ def iter_media_files(
     *,
     recurse: bool = True,
     skip_path_prefixes: tuple[str, ...] = (),
+    include_globs: tuple[str, ...] = (),
 ) -> Iterator[Path]:
     exts = MEDIA_EXTENSIONS
     root_r = root.resolve()
@@ -246,14 +285,25 @@ def iter_media_files(
     def rel_to_root(p: Path) -> str:
         return p.relative_to(root_r).as_posix()
 
+    def file_allowed(rel_posix: str) -> bool:
+        if skip_path_prefixes and _is_rel_under_skip_prefix(rel_posix, skip_path_prefixes):
+            return False
+        if include_globs and not _rel_matches_include_globs(rel_posix, include_globs):
+            return False
+        return True
+
     if not skip_path_prefixes:
         if recurse:
             for p in root_r.rglob("*"):
-                if p.is_file() and p.suffix.lower() in exts:
+                if not p.is_file() or p.suffix.lower() not in exts:
+                    continue
+                if file_allowed(rel_to_root(p)):
                     yield p
         else:
             for p in root_r.iterdir():
-                if p.is_file() and p.suffix.lower() in exts:
+                if not p.is_file() or p.suffix.lower() not in exts:
+                    continue
+                if file_allowed(rel_to_root(p)):
                     yield p
         return
 
@@ -261,9 +311,8 @@ def iter_media_files(
         for p in root_r.iterdir():
             if not p.is_file() or p.suffix.lower() not in exts:
                 continue
-            if _is_rel_under_skip_prefix(rel_to_root(p), skip_path_prefixes):
-                continue
-            yield p
+            if file_allowed(rel_to_root(p)):
+                yield p
         return
 
     for dirpath, dirnames, filenames in os.walk(root_r, topdown=True):
@@ -283,9 +332,8 @@ def iter_media_files(
             if p.suffix.lower() not in exts:
                 continue
             rel_file = f"{rel_dir}/{name}" if rel_dir else name
-            if _is_rel_under_skip_prefix(rel_file, skip_path_prefixes):
-                continue
-            yield p
+            if file_allowed(rel_file):
+                yield p
 
 
 def unique_dest(path: Path, *, reserved: set[Path] | None = None) -> Path:
@@ -390,7 +438,7 @@ def _pc_local_utc_offset_colon() -> str:
 
 def _fmt_naive_dt_with_pc_zone(dt: datetime) -> str:
     """Naive source/copy wall time with explicit PC zone, e.g. ``2023-10-25 07:15:00 [+03:00]``."""
-    return f"{dt.isoformat(sep=' ', timespec='seconds')} [{_pc_local_utc_offset_colon()}]"
+    return f"{dt.isoformat(sep=' ', timespec='seconds')}{_pc_local_utc_offset_colon()}"
 
 
 def _fmt_set_created_display(dt: datetime | None) -> str:

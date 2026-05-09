@@ -5,12 +5,17 @@ Plausibility bounds and timezone-naive normalization shared by extractors and ru
 from __future__ import annotations
 
 import re
+import argparse
 from datetime import datetime, timedelta, timezone, tzinfo
 
 from .models import HeuristicConfig
 
-# EXIF and filename timestamps are usually timezone-naive; mtime is local.
-TZ_NAIVE_VS_MODIFIED_EQUIV_MAX = timedelta(days=1)
+# Naive capture times vs filesystem mtime (local wall clocks): “close enough” to treat as the same
+# ambiguity band — bounded by the largest plausible civil skew across zones (UTC−12 vs UTC+14 ≈ 26h).
+TZ_NAIVE_VS_MODIFIED_EQUIV_MAX = timedelta(hours=26)
+
+# Without TZ-aware capture metadata, skip filename-based overrides when within this bound of mtime.
+FILENAME_VS_MTIME_CLOSE_MAX = TZ_NAIVE_VS_MODIFIED_EQUIV_MAX
 
 # When EXIF vs clock-in-name disagree only slightly, prefer filename (camera stem).
 EXIF_VS_FILENAME_CLOCK_MAX_DELTA = timedelta(minutes=1)
@@ -111,6 +116,43 @@ def _zoneinfo_by_name(name: str):
         return None
 
 
+def normalize_iana_timezone_name(s: str) -> str:
+    """
+    Argparse type for IANA timezone names.
+
+    Returns the normalized name (trimmed) if it resolves via ZoneInfo; raises otherwise.
+    """
+    t = (s or "").strip()
+    if not t:
+        raise argparse.ArgumentTypeError("empty timezone")
+    if _zoneinfo_by_name(t) is None:
+        raise argparse.ArgumentTypeError(f"unknown IANA timezone: {t!r}")
+    return t
+
+
+def attach_gps_iana_zone_to_naive_exif(
+    naive_dt: datetime, gps_iana_timezone_name: str | None
+) -> datetime | None:
+    """
+    If ``naive_dt`` has no ``tzinfo`` and ``gps_iana_timezone_name`` resolves (e.g. from GPS +
+    timezonefinder in :func:`read_exif_capture`), return that instant as timezone-aware in that
+    zone. If ``naive_dt`` is already aware, return it unchanged. Return ``None`` when the name is
+    missing, lookup fails, or replacement raises.
+    """
+    if naive_dt.tzinfo is not None:
+        return naive_dt
+    name = (gps_iana_timezone_name or "").strip()
+    if not name:
+        return None
+    zi = _zoneinfo_by_name(name)
+    if zi is None:
+        return None
+    try:
+        return naive_dt.replace(tzinfo=zi)
+    except Exception:
+        return None
+
+
 def naive_exif_with_gps_local_timezone(
     naive_dt: datetime, lat: float, lon: float
 ) -> tuple[datetime, str | None, str | None]:
@@ -150,6 +192,7 @@ def filesystem_instant_for_rule(
     rule_kind: str,
     exif_best: datetime | None,
     gps_iana: str | None,
+    fallback_iana: str | None = None,
 ) -> datetime:
     """
     Rules often emit **naive** wall times (filename digits, stripped EXIF). For
@@ -159,12 +202,22 @@ def filesystem_instant_for_rule(
     """
     if new_created.tzinfo is not None:
         return new_created
-    if rule_kind not in ("filename_earlier_than_metadata", "exif_earlier_than_metadata"):
+    if rule_kind not in (
+        "filename_earlier_than_metadata",
+        "exif_earlier_than_metadata",
+        "embedded_timezone_authoritative",
+        "filename_refines_metadata_seconds",
+        "exif_matches_filename_clock",
+    ):
         return new_created
     if exif_best is not None and exif_best.tzinfo is not None:
         return new_created.replace(tzinfo=exif_best.tzinfo)
     if gps_iana:
         zi = _zoneinfo_by_name(gps_iana)
+        if zi is not None:
+            return new_created.replace(tzinfo=zi)
+    if fallback_iana and exif_best is not None and exif_best.tzinfo is None:
+        zi = _zoneinfo_by_name(fallback_iana)
         if zi is not None:
             return new_created.replace(tzinfo=zi)
     return new_created
@@ -216,12 +269,73 @@ def exif_ambiguous_vs_modified(exif: datetime, modified: datetime) -> bool:
 
 
 def filename_ambiguous_vs_modified(dt: datetime, modified: datetime) -> bool:
-    """True when filename datetime and mtime are close but not identical (likely TZ mismatch)."""
+    """
+    True when the parsed filename clock and filesystem mtime are both naive local wall times
+    within :data:`TZ_NAIVE_VS_MODIFIED_EQUIV_MAX` of each other but not equal.
+
+    This comparison is **only naive wall clocks** on the host (and parsed stem tokens). It does
+    not see capture offset vs OS local: the same absolute instant can appear ~one zone step
+    apart (e.g. EXIF ``09:23:50+02`` vs file ``10:23:00`` as local ``+03`` are the same moment).
+    In that situation stem digits still align with EXIF civil time; use
+    :func:`exif_correlates_with_clock_filename` together with rules that prefer the embedded
+    filename time so this heuristic does not block clock-in-name precedence.
+    """
     dt = naive_local(dt)
     modified = naive_local(modified)
     if dt == modified:
         return False
     return abs(dt - modified) <= TZ_NAIVE_VS_MODIFIED_EQUIV_MAX
+
+
+def suppress_filename_override_without_tz_aware_metadata(
+    filename_dt: datetime,
+    filesystem_ref: datetime,
+    *,
+    has_tz_aware_capture_metadata: bool,
+) -> bool:
+    """
+    Without timezone-aware EXIF/XMP/ISO capture time (and no GPS IANA zone in rules), filename
+    digits are not reliable in the PC's local timezone. If the parsed filename datetime is within
+    :data:`FILENAME_VS_MTIME_CLOSE_MAX` of ``filesystem_ref`` (naive wall clocks; use
+    ``min(created, modified)`` from rules to match ``d < earliest``), do **not** use the filename
+    to set destination timestamps.
+    """
+    if has_tz_aware_capture_metadata:
+        return False
+    fn = naive_local(filename_dt)
+    ref = naive_local(filesystem_ref)
+    if fn == ref:
+        return True
+    return abs(fn - ref) <= FILENAME_VS_MTIME_CLOSE_MAX
+
+
+def should_exclude_filename_precedence_candidate(
+    filename_dt: datetime,
+    includes_clock_in_name: bool,
+    filesystem_ref: datetime,
+    *,
+    has_tz_aware_capture_metadata: bool,
+    stem_correlates_with_exif_clock: bool,
+) -> bool:
+    """
+    Whether ``filename_dt`` must not enter ``filename_earlier_than_metadata`` qualification.
+
+    Combines clock-vs-filesystem “ambiguity” when capture time has an explicit offset (or GPS
+    zone at the rules layer) with the no-aware-metadata suppression path, so we do not apply
+    both checks redundantly. ``filesystem_ref`` should match rules’ ``earliest`` (``min(created,
+    modified)``) for consistent comparison with ``d < earliest``.
+    """
+    if stem_correlates_with_exif_clock:
+        return False
+    if has_tz_aware_capture_metadata:
+        if not includes_clock_in_name:
+            return False
+        return filename_ambiguous_vs_modified(filename_dt, filesystem_ref)
+    return suppress_filename_override_without_tz_aware_metadata(
+        filename_dt,
+        filesystem_ref,
+        has_tz_aware_capture_metadata=False,
+    )
 
 
 def exif_civil_clock_for_stem_compare(exif: datetime) -> datetime:
@@ -269,3 +383,43 @@ def exif_correlates_with_clock_filename(
         if abs(exif_wall - fn_dt) <= EXIF_VS_FILENAME_CLOCK_MAX_DELTA:
             return True
     return False
+
+
+def exif_filename_clock_preference(
+    exif: datetime,
+    fn_entries: list[tuple[datetime, bool]],
+) -> tuple[str, datetime] | None:
+    """
+    If EXIF and a clock-bearing filename time correlate within
+    ``EXIF_VS_FILENAME_CLOCK_MAX_DELTA`` (and are not identical), decide which one to prefer.
+
+    Returns (preference, matched_filename_dt) where preference is:
+    - ``"filename"`` when the filename clock is earlier (EXIF is later within the window)
+    - ``"exif"`` when EXIF civil clock is earlier (filename is later within the window)
+
+    The filename dt returned is the best (closest) clock-bearing match.
+    """
+    exif_wall = exif_civil_clock_for_stem_compare(exif)
+    best: tuple[float, datetime] | None = None
+    best_sign: int | None = None
+    for fn_dt, inc in fn_entries:
+        if not inc:
+            continue
+        fn_dt = naive_local(fn_dt)
+        if exif_wall == fn_dt:
+            continue
+        delta_s = (exif_wall - fn_dt).total_seconds()
+        if abs(delta_s) > EXIF_VS_FILENAME_CLOCK_MAX_DELTA.total_seconds():
+            continue
+        score = abs(delta_s)
+        if best is None or score < best[0]:
+            best = (score, fn_dt)
+            # sign: + means EXIF later than filename, - means EXIF earlier
+            best_sign = 1 if delta_s > 0 else -1
+
+    if best is None or best_sign is None:
+        return None
+    _score, matched_fn = best
+    if best_sign > 0:
+        return "filename", matched_fn
+    return "exif", matched_fn

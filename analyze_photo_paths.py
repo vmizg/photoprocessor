@@ -200,13 +200,21 @@ def main() -> int:
             fname = rel.name
 
             created, modified = op.file_times(fpath)
-            exif_dt = op._try_exif_datetime_original(fpath)
+            exif_cap = op.read_exif_capture(fpath)
+            exif_dt = exif_cap.best_datetime
             earliest_dt = created if created <= modified else modified
             earliest_label = "created" if earliest_dt == created else "modified"
 
             rel_parts_dating = op.rel_parts_for_path_dating(fpath, root_r)
             planned = op.decide_actions(
-                rel_parts_dating, fname, created, modified, exif_dt, now, cfg
+                rel_parts_dating,
+                fname,
+                created,
+                modified,
+                exif_dt,
+                now,
+                cfg,
+                exif_gps_timezone_name=exif_cap.gps_timezone_name,
             )
             primary = op.primary_time_action(planned)
             primary_kind = primary.kind if primary is not None else "move_only_no_time_change"

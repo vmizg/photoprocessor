@@ -686,6 +686,32 @@ def run_skip_path_cli_smoke_test(errors: list[str]) -> None:
             )
 
 
+def run_move_only_flag_smoke_test(errors: list[str]) -> None:
+    """--move-only skips dating rules; filename clock in stem must not set copy time."""
+    with tempfile.TemporaryDirectory(prefix="organize_move_only_") as tmp:
+        root = Path(tmp) / "src"
+        dest = Path(tmp) / "out"
+        state = Path(tmp) / "state.json"
+        write_dummy_photo(root / "filename_clock" / "IMG_20100615_143022.jpg")
+        code, out = run_organizer(root, dest, True, state, extra_args=["--move-only"])
+        if code != 0:
+            errors.append(f"--move-only smoke exit {code}")
+        if "Done. Files processed: 1." not in out:
+            errors.append(f"--move-only: expected 1 file processed\n{out[-1200:]}")
+        block = _paragraph_for_rel(out, "filename_clock/IMG_20100615_143022.jpg")
+        if block is None:
+            errors.append("--move-only: missing verbose paragraph for IMG file")
+        else:
+            if "rule=move_only_no_time_change" not in block:
+                errors.append(
+                    f"--move-only: expected rule=move_only_no_time_change\n{block}"
+                )
+            if "set_created=2010-06-15" in block:
+                errors.append(
+                    "--move-only: must not apply filename clock (2010) to set_created"
+                )
+
+
 def run_organize_photos_import_library_tests(errors: list[str]) -> None:
     """Import ``src.organize_photos`` and exercise parsers, rules, scoring, I/O helpers, iterators."""
     sd = str(_REPO_ROOT)
@@ -811,7 +837,7 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         )
         fn_stem = datetime(2022, 10, 25, 14, 41, 35)
         fs_out = _fs_inst(
-            fn_stem, "filename_earlier_than_metadata", exif_plus8, "Asia/Singapore"
+            fn_stem, "filename_earlier_than_metadata", exif_plus8, "Asia/Singapore", None
         )
         want_ts = datetime(
             2022, 10, 25, 14, 41, 35, tzinfo=_tz(timedelta(hours=8))
@@ -825,9 +851,61 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
             "structured_path_oldest_signal",
             exif_plus8,
             None,
+            None,
         )
         if fs_plain.tzinfo is not None:
             errors.append("filesystem_instant_for_rule must not attach TZ for non filename/exif rules")
+
+        # Naive embedded time with fallback timezone must not use local machine tz.
+        naive_exif = datetime(2022, 11, 29, 13, 50, 0)
+        fs_fallback = _fs_inst(
+            naive_exif,
+            "exif_earlier_than_metadata",
+            naive_exif,
+            None,
+            "UTC",
+        )
+        if fs_fallback.tzinfo is None or abs(
+            fs_fallback.timestamp()
+            - datetime(2022, 11, 29, 13, 50, 0, tzinfo=timezone.utc).timestamp()
+        ) > 1.0:
+            errors.append(
+                f"fallback-timezone: expected naive embedded treated as UTC instant, got {fs_fallback!r}"
+            )
+
+        # Minimal MP4 (moov/mvhd): container "Media created" via mvhd Apple epoch.
+        sec_mv = int(
+            (
+                datetime(2019, 12, 25, 15, 0, 0, tzinfo=timezone.utc)
+                - datetime(1904, 1, 1, tzinfo=timezone.utc)
+            ).total_seconds()
+        )
+        body_mv = bytearray(100)
+        body_mv[0] = 0
+        body_mv[12:16] = sec_mv.to_bytes(4, "big")
+        mvhd_b = (8 + len(body_mv)).to_bytes(4, "big") + b"mvhd" + bytes(body_mv)
+        moov_b = (8 + len(mvhd_b)).to_bytes(4, "big") + b"moov" + mvhd_b
+        with tempfile.TemporaryDirectory(prefix="op_mini_mp4_") as _mtd:
+            _vp = Path(_mtd) / "mini.mp4"
+            _vp.write_bytes(moov_b)
+            cap_mv = op.read_exif_capture(_vp)
+        if cap_mv.best_datetime is None:
+            errors.append("read_exif_capture: minimal MP4 mvhd should yield a datetime")
+        else:
+            want_mv = datetime(2019, 12, 25, 15, 0, 0, tzinfo=timezone.utc)
+            if abs(cap_mv.best_datetime.timestamp() - want_mv.timestamp()) > 2.0:
+                errors.append(
+                    f"minimal mp4 mvhd instant wrong: got {cap_mv.best_datetime!r}"
+                )
+        if not cap_mv.video_metadata_source:
+            errors.append("read_exif_capture: video should set video_metadata_source")
+        elif not (
+            cap_mv.video_metadata_source == "mp4:mvhd.creation_time"
+            or cap_mv.video_metadata_source.startswith("ffprobe:")
+        ):
+            errors.append(
+                f"unexpected video_metadata_source for mini mp4: {cap_mv.video_metadata_source!r}"
+            )
 
         # ExifCaptureInfo hint_string: tz~GPS replaces redundant GPS=yes
         cap = ExifCaptureInfo(
@@ -884,14 +962,15 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
                 "EXIF exactly 1 day before mtime should not trigger exif_earlier_than_metadata"
             )
 
-        exif_over = datetime(2010, 6, 14, 11, 59, 59)
-        mod_over = datetime(2010, 6, 15, 12, 0, 0)
-        if (mod_over - exif_over) <= timedelta(days=1):
-            errors.append("unit test bug: expected >24h between exif_over and mod_over")
+        # Just beyond TZ_NAIVE_VS_MODIFIED_EQUIV_MAX (26h), not merely beyond 24h.
+        exif_over = datetime(2010, 6, 14, 12, 0, 0)
+        mod_over = datetime(2010, 6, 15, 14, 1, 0)
+        if (mod_over - exif_over) <= timedelta(hours=26):
+            errors.append("unit test bug: expected >26h between exif_over and mod_over")
         acts_over = op.decide_actions([], "x.jpg", mod_over, mod_over, exif_over, now, cfg)
         if not any(a.kind == "exif_earlier_than_metadata" for a in acts_over):
             errors.append(
-                "EXIF >24h before mtime should still trigger exif_earlier_than_metadata"
+                "EXIF beyond naive-vs-mtime equiv window should still trigger exif_earlier_than_metadata"
             )
 
         # EXIF vs filename clock within 1 minute (camera DCIM): prefer filename, not exif-alone.
@@ -921,6 +1000,66 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
                 f"DCIM skew: expected filename 10:06:59, got {pk_dcim.new_created}"
             )
 
+        # If filesystem times lose seconds precision (minute-rounded), but filename clock has
+        # seconds and EXIF has an explicit offset that correlates with the stem, refine to stem.
+        # Create a host-local filesystem time that matches the EXIF(+08) instant but is
+        # minute-rounded (seconds dropped). Use astimezone() so the test is independent of
+        # the machine's local offset.
+        _stem_in_exif_tz = datetime(
+            2022, 11, 19, 10, 6, 59, tzinfo=timezone(timedelta(hours=8))
+        )
+        fs_minute_rounded = (
+            _stem_in_exif_tz.astimezone().replace(tzinfo=None, second=0, microsecond=0)
+        )
+        exif_plus8_near_stem = datetime(
+            2022, 11, 19, 10, 7, 0, tzinfo=timezone(timedelta(hours=8))
+        )
+        acts_refine = op.decide_actions(
+            [],
+            "IMG_20221119_100659.jpg",
+            fs_minute_rounded,
+            fs_minute_rounded,
+            exif_plus8_near_stem,
+            now,
+            cfg,
+        )
+        pk_refine = op.primary_time_action(acts_refine)
+        if pk_refine is None or pk_refine.kind != "embedded_timezone_authoritative":
+            errors.append(
+                "minute-rounded + aware EXIF: expected embedded_timezone_authoritative, got "
+                f"{[a.kind for a in acts_refine]}"
+            )
+        elif pk_refine.new_created != exif_plus8_near_stem:
+            errors.append(
+                f"minute-rounded refine: expected aware EXIF {exif_plus8_near_stem!r}, got {pk_refine.new_created!r}"
+            )
+
+        # If filesystem times are in a different host-local hour but EXIF offset correlates with
+        # the stem clock, prefer filename clock (e.g. EXIF +08 vs filesystem +03).
+        fs_host_local = datetime(2023, 11, 1, 6, 49, 0)
+        exif_offset = datetime(
+            2023, 11, 1, 12, 49, 38, tzinfo=timezone(timedelta(hours=8))
+        )
+        acts_match = op.decide_actions(
+            [],
+            "IMG_20231101_124936.jpg",
+            fs_host_local,
+            fs_host_local,
+            exif_offset,
+            now,
+            cfg,
+        )
+        pk_match = op.primary_time_action(acts_match)
+        if pk_match is None or pk_match.kind != "embedded_timezone_authoritative":
+            errors.append(
+                "aware EXIF + stem: expected embedded_timezone_authoritative, got "
+                f"{[a.kind for a in acts_match]}"
+            )
+        elif pk_match.new_created != exif_offset:
+            errors.append(
+                f"EXIF offset match: expected aware EXIF {exif_offset!r}, got {pk_match.new_created!r}"
+            )
+
         # Same stem; EXIF >1 minute from filename clock → keep exif_earlier_than_metadata.
         exif_wide_skew = datetime(2022, 11, 19, 10, 9, 0)
         acts_exif_beats_fn = op.decide_actions(
@@ -943,6 +1082,24 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
                 f"EXIF >1min skew: expected EXIF time {exif_wide_skew}, got {pk_wide.new_created}"
             )
 
+        # EXIF earlier than filename by a few seconds (within 1 minute) → prefer EXIF.
+        exif_earlier = datetime(2022, 11, 19, 10, 6, 57, tzinfo=timezone(timedelta(hours=8)))
+        acts_exif_early = op.decide_actions(
+            [],
+            "IMG_20221119_100659.jpg",
+            fs_dcim,
+            fs_dcim,
+            exif_earlier,
+            now,
+            cfg,
+        )
+        pk_ex_early = op.primary_time_action(acts_exif_early)
+        if pk_ex_early is None or pk_ex_early.kind != "embedded_timezone_authoritative":
+            errors.append(
+                "aware EXIF earlier within 1min of stem: expected embedded_timezone_authoritative, got "
+                f"{[a.kind for a in acts_exif_early]}"
+            )
+
         # Aware EXIF (+08): stem correlation must use civil clock, not host OS local.
         exif_plus8 = datetime(
             2022, 11, 19, 10, 7, 3, tzinfo=timezone(timedelta(hours=8))
@@ -958,16 +1115,16 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         )
         if any(a.kind == "exif_earlier_than_metadata" for a in acts_plus8):
             errors.append(
-                "aware EXIF +08 vs stem: expected filename precedence, not exif_earlier_than_metadata"
+                "aware EXIF +08 vs stem: must not use exif_earlier_than_metadata (use embedded rule)"
             )
         pk_p8 = op.primary_time_action(acts_plus8)
-        if pk_p8 is None or pk_p8.kind != "filename_earlier_than_metadata":
+        if pk_p8 is None or pk_p8.kind != "embedded_timezone_authoritative":
             errors.append(
-                f"aware +08 stem compare: expected filename rule, got {[a.kind for a in acts_plus8]}"
+                f"aware +08 stem compare: expected embedded_timezone_authoritative, got {[a.kind for a in acts_plus8]}"
             )
-        elif pk_p8.new_created != datetime(2022, 11, 19, 10, 6, 59):
+        elif pk_p8.new_created != exif_plus8:
             errors.append(
-                f"aware +08: expected filename 10:06:59, got {pk_p8.new_created}"
+                f"aware +08: expected embedded EXIF {exif_plus8!r}, got {pk_p8.new_created}"
             )
 
         # --- Filename timestamp vs mtime 1-day tolerance (timezone naive) ---
@@ -1006,6 +1163,76 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
             errors.append(
                 "filename >1 day from mtime should still trigger filename_earlier_than_metadata"
             )
+
+        # Date-only filename (no clock in name): without TZ-aware EXIF, do not set time from
+        # filename when parsed date is within ±1 day of mtime (date-only bypasses clock ambiguity).
+        created_do = datetime(2013, 1, 1, 15, 0, 0)
+        modified_do = datetime(2013, 1, 1, 15, 0, 0)
+        acts_do = op.decide_actions(
+            [],
+            "pics_20130101_album.jpg",
+            created_do,
+            modified_do,
+            None,
+            now,
+            cfg,
+        )
+        if any(a.kind == "filename_earlier_than_metadata" for a in acts_do):
+            errors.append(
+                "date-only near mtime without aware EXIF: must not use filename_earlier_than_metadata"
+            )
+        if op.primary_time_action(acts_do) is not None:
+            errors.append(
+                f"date-only near mtime: expected no dating action, got {[a.kind for a in acts_do]}"
+            )
+
+        # Naive stem vs naive mtime can differ by one offset step while still one instant:
+        # EXIF 09:23:50+02 and filesystem 10:23 local +03 are the same moment; stem 09:23:48
+        # matches EXIF within 1 minute — qualify filename despite naive stem-vs-mtime ambiguity.
+        exif_maria = datetime(
+            2024, 5, 28, 9, 23, 50, tzinfo=timezone(timedelta(hours=2))
+        )
+        fs_maria = datetime(2024, 5, 28, 10, 23, 0)
+        acts_maria = op.decide_actions(
+            [],
+            "IMG_20240528_092348.jpg",
+            fs_maria,
+            fs_maria,
+            exif_maria,
+            now,
+            cfg,
+        )
+        pk_maria = op.primary_time_action(acts_maria)
+        if pk_maria is None or pk_maria.kind != "embedded_timezone_authoritative":
+            errors.append(
+                "+02/+03 with aware EXIF: expected embedded_timezone_authoritative, "
+                f"got {[a.kind for a in acts_maria]}"
+            )
+        elif pk_maria.new_created != exif_maria:
+            errors.append(
+                f"+02/+03 case: expected aware EXIF {exif_maria!r}, got {pk_maria.new_created!r}"
+            )
+
+        # Naive EXIF + GPS-derived IANA zone (no OffsetTime tag): authoritative like aware embedded.
+        exif_naive_gps = datetime(2024, 6, 15, 14, 30, 0)
+        acts_gps_zone = op.decide_actions(
+            [],
+            "IMG_20240615_143022.jpg",
+            datetime(2024, 6, 20, 12, 0, 0),
+            datetime(2024, 6, 20, 12, 0, 0),
+            exif_naive_gps,
+            now,
+            cfg,
+            exif_gps_timezone_name="Europe/Berlin",
+        )
+        pk_gz = op.primary_time_action(acts_gps_zone)
+        if pk_gz is None or pk_gz.kind != "embedded_timezone_authoritative":
+            errors.append(
+                "naive EXIF + GPS IANA: expected embedded_timezone_authoritative, got "
+                f"{[a.kind for a in acts_gps_zone]}"
+            )
+        elif pk_gz.new_created is None or pk_gz.new_created.tzinfo is None:
+            errors.append("naive EXIF + GPS IANA: expected timezone-aware new_created")
 
         # Real-world combined case: year folder + filename clock + EXIF present but ambiguous vs mtime.
         # Expect fallback to mtime (not EXIF, not filename), and folder rule suppressed since mtime is within the year.
@@ -1318,6 +1545,14 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
         except argparse_mod.ArgumentTypeError:
             pass
 
+        if op.normalize_include_glob_arg("x\\**\\*.mp4") != "x/**/*.mp4":
+            errors.append("normalize_include_glob_arg backslash mix")
+        try:
+            op.normalize_include_glob_arg("a/../b/*.mp4")
+            errors.append("normalize_include_glob_arg should reject ..")
+        except argparse_mod.ArgumentTypeError:
+            pass
+
         # --- iter_media_files ---
         with tempfile.TemporaryDirectory(prefix="op_iter_") as ti:
             ir = Path(ti)
@@ -1336,6 +1571,18 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
             )
             if n_skip != 2:
                 errors.append(f"iter_media_files skip deep expected 2, got {n_skip}")
+            n_mp4 = len(list(op.iter_media_files(ir, include_globs=("**/*.mp4",))))
+            if n_mp4 != 1:
+                errors.append(f"iter_media_files include **/*.mp4 expected 1, got {n_mp4}")
+            n_pair = len(
+                list(
+                    op.iter_media_files(
+                        ir, include_globs=("deep/in.jpg", "vid.mp4")
+                    )
+                )
+            )
+            if n_pair != 2:
+                errors.append(f"iter_media_files two include globs expected 2, got {n_pair}")
 
         # --- state JSON ---
         with tempfile.TemporaryDirectory(prefix="op_state_") as ts:
@@ -1377,7 +1624,7 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
 
 
 def run_cli_edge_case_tests(errors: list[str]) -> None:
-    """Argparse validation, --no-recurse, media types, --no-dedupe-scoring."""
+    """Argparse validation, --no-recurse, media types."""
     with tempfile.TemporaryDirectory(prefix="op_cli_") as tmp:
         base = Path(tmp)
         src = base / "src"
@@ -1399,6 +1646,20 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
         )
         if code_bad == 0:
             errors.append("CLI should reject --skip-path with ..")
+
+        code_bad_glob, _ = _run_cli_main_captured(
+            [
+                "--source",
+                str(src),
+                "--dest",
+                str(dest),
+                "--include-glob",
+                "x/../y/*.mp4",
+                "--dry-run",
+            ]
+        )
+        if code_bad_glob == 0:
+            errors.append("CLI should reject --include-glob with ..")
 
         # --no-recurse: only top-level media
         write_dummy_photo(src / "visible.jpg")
@@ -1439,21 +1700,26 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
         if "Skipped duplicate:" in out_s:
             errors.append("--silence-skipped should not log Skipped duplicate at INFO level")
 
-        # --no-dedupe-scoring: second same-name file gets _1
-        src3 = base / "src3"
-        dest3 = base / "dest3"
-        src3.mkdir()
-        dest3.mkdir()
-        write_dummy_photo(src3 / "a" / "dup.jpg")
-        write_dummy_photo(src3 / "b" / "dup.jpg")
-        code_d, out_d = run_organizer(
-            src3, dest3, True, base / "st3.json", extra_args=["--no-dedupe-scoring"]
+        # --include-glob: only paths matching (e.g. videos for re-run fix pass)
+        src_g = base / "src_glob"
+        dest_g = base / "dest_glob"
+        src_g.mkdir()
+        dest_g.mkdir()
+        write_dummy_photo(src_g / "only.jpg")
+        write_dummy_photo(src_g / "nested" / "also.jpg")
+        (src_g / "clip.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        code_ig, out_ig = run_organizer(
+            src_g,
+            dest_g,
+            True,
+            base / "st_g.json",
+            extra_args=["--include-glob", "**/*.mp4"],
         )
-        if code_d != 0:
-            errors.append(f"--no-dedupe-scoring exit {code_d}")
-        if "dup_1.jpg" not in out_d.replace("\\", "/"):
+        if code_ig != 0:
+            errors.append(f"--include-glob exit {code_ig}")
+        if "Done. Files processed: 1." not in out_ig:
             errors.append(
-                "expected unique_dest suffix dup_1.jpg for second copy in legacy mode"
+                f"--include-glob **/*.mp4 expected 1 file, got:\n{out_ig[-700:]}"
             )
 
         # Windows: dedupe scoring should collapse case/Unicode-equivalent slot names.
@@ -1576,6 +1842,14 @@ def main() -> int:
 
     print("\n=== --skip-path CLI smoke ===\n")
     run_skip_path_cli_smoke_test(errors)
+    if errors:
+        print("\nFAILED:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+
+    print("\n=== --move-only CLI smoke ===\n")
+    run_move_only_flag_smoke_test(errors)
     if errors:
         print("\nFAILED:", file=sys.stderr)
         for e in errors:

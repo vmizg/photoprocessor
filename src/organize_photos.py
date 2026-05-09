@@ -42,6 +42,7 @@ from .io_ops import (
     file_times,
     is_prior_organizer_output,
     iter_media_files,
+    normalize_include_glob_arg,
     normalize_skip_path_arg,
     unique_dest,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "match_structured_path",
     "migrate_state_slot_keys",
     "naive_local",
+    "normalize_include_glob_arg",
     "normalize_skip_path_arg",
     "normalize_slot_key_for_dedupe",
     "parse_path_calendar",
