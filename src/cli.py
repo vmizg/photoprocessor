@@ -28,8 +28,6 @@ from .extractors import (
 from .neighbor_tz import build_neighbor_tz_map
 from .io_ops import (
     DEFAULT_LOG_ARG_SENTINEL,
-    append_backup_manifest,
-    backup_path_for,
     emit_to_both,
     file_times,
     is_prior_organizer_output,
@@ -85,23 +83,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Log actions only; no copies, no dest/year folders, no state JSON on disk.",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument(
-        "--backup-dir",
-        type=Path,
-        default=None,
-        help="Optional extra copy of each source file here (source is never modified). "
-        "Ignored with --dry-run.",
-    )
-    ap.add_argument(
-        "--flat-backup-names",
-        action="store_true",
-        help="Store backups as <hash>.<ext> under --backup-dir (shorter paths on Windows).",
-    )
-    ap.add_argument(
-        "--remove-backup-on-success",
-        action="store_true",
-        help="Delete per-file backup copy after successful copy to --dest (saves disk).",
-    )
     ap.add_argument(
         "--log",
         nargs="?",
@@ -255,13 +236,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.dry_run:
         dest.mkdir(parents=True, exist_ok=True)
-        if args.backup_dir is not None:
-            Path(args.backup_dir).resolve().mkdir(parents=True, exist_ok=True)
-
-    if not args.dry_run and args.backup_dir is None:
         log.info(
-            "Source files are never modified; output is copied to --dest. "
-            "Optional --backup-dir keeps an extra copy of each source file elsewhere."
+            "Source files are never modified; output is copied to --dest.",
         )
 
     if args.state_file is not None:
@@ -306,7 +282,6 @@ def main(argv: list[str] | None = None) -> int:
     path_review_count = 0
     path_review_samples: list[str] = []
     dest_res = dest.resolve()
-    backup_root_res = Path(args.backup_dir).resolve() if args.backup_dir else None
 
     log.info(
         "Destination names: <dest>/<YEAR>/<original name>. "
@@ -395,8 +370,6 @@ def main(argv: list[str] | None = None) -> int:
             min_year=args.min_year,
             max_year=args.max_year,
         ):
-            continue
-        if backup_root_res is not None and backup_root_res in fp_res.parents:
             continue
         try:
             rel = fpath.relative_to(source)
@@ -575,26 +548,6 @@ def main(argv: list[str] | None = None) -> int:
             processed += 1
             continue
 
-        backup_abs: Path | None = None
-        backup_root_path: Path | None = None
-        if args.backup_dir is not None:
-            backup_root_path = Path(args.backup_dir).resolve()
-            backup_abs = backup_path_for(
-                backup_root_path, rel, args.flat_backup_names
-            )
-            try:
-                backup_abs.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(fpath, backup_abs)
-                append_backup_manifest(
-                    backup_root_path, rel, backup_abs, args.flat_backup_names
-                )
-                log.debug("Backup: %s -> %s", fpath, backup_abs)
-            except OSError as e:
-                errors += 1
-                log.exception("Backup failed for %s: %s", fpath, e)
-                processed += 1
-                continue
-
         try:
             year_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fpath, target)
@@ -649,15 +602,6 @@ def main(argv: list[str] | None = None) -> int:
             state["slots"][sk] = slot_entry
             state_batcher.after_mutation(state)
 
-            if (
-                args.remove_backup_on_success
-                and backup_abs is not None
-                and backup_abs.is_file()
-            ):
-                try:
-                    backup_abs.unlink()
-                except OSError as e:
-                    log.warning("Could not remove backup %s: %s", backup_abs, e)
         except Exception as e:
             errors += 1
             log.exception("Failed processing %s: %s", fpath, e)

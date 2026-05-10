@@ -1,12 +1,11 @@
-"""Filesystem I/O: times, copy/backup, logging, summaries, media walk."""
+"""Filesystem I/O: times, copy, logging, summaries, media walk."""
 
 from __future__ import annotations
 
 import argparse
 import ctypes
-import hashlib
-import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -22,10 +21,59 @@ if TYPE_CHECKING:
     from .models import Action
 
 
+def _local_naive_from_stat_seconds(ts: float) -> datetime | None:
+    """
+    Convert a :meth:`Path.stat` timestamp to naive local datetime.
+
+    Returns None when the value is non-finite or :func:`datetime.fromtimestamp`
+    refuses it (Windows can raise ``OSError`` for out-of-range storage).
+    """
+    try:
+        if math.isnan(ts) or math.isinf(ts):
+            return None
+        return datetime.fromtimestamp(ts)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def file_times(path: Path) -> tuple[datetime, datetime]:
-    """Return (creation, modification) as naive local datetimes."""
+    """Return (creation, modification) as naive local datetimes.
+
+    On Windows, ``st_ctime`` is creation time. If either timestamp cannot be
+    converted, the other is reused; if both fail, both are set to now.
+    """
     st = path.stat()
-    return datetime.fromtimestamp(st.st_ctime), datetime.fromtimestamp(st.st_mtime)
+    c = _local_naive_from_stat_seconds(st.st_ctime)
+    m = _local_naive_from_stat_seconds(st.st_mtime)
+    log = logging.getLogger("organize_photos")
+
+    if c is None and m is not None:
+        log.warning(
+            "Unusable creation time (ctime=%s) for %s; using modification time for both.",
+            st.st_ctime,
+            path,
+        )
+        c = m
+    elif m is None and c is not None:
+        log.warning(
+            "Unusable modification time (mtime=%s) for %s; using creation time for both.",
+            st.st_mtime,
+            path,
+        )
+        m = c
+    elif c is None and m is None:
+        log.warning(
+            "Unusable creation and modification time (ctime=%s, mtime=%s) for %s; "
+            "using current local time for both.",
+            st.st_ctime,
+            st.st_mtime,
+            path,
+        )
+        now = datetime.now()
+        return now, now
+
+    assert c is not None and m is not None
+    return c, m
 
 
 def same_size_created_mtime(a: Path, b: Path) -> bool:
@@ -447,26 +495,6 @@ def unique_dest(path: Path, *, reserved: set[Path] | None = None) -> Path:
         if not taken(cand):
             return cand
         n += 1
-
-
-def backup_path_for(backup_root: Path, rel: Path, use_flat_hash: bool) -> Path:
-    if use_flat_hash:
-        h = hashlib.sha256(str(rel.as_posix()).encode("utf-8")).hexdigest()[:24]
-        return backup_root / f"{h}{rel.suffix.lower()}"
-    out = backup_root / rel
-    return out
-
-
-def append_backup_manifest(
-    backup_root: Path, rel: Path, backup_abs: Path, flat: bool
-) -> None:
-    man = backup_root / "manifest.jsonl"
-    rec = {
-        "source_relative": rel.as_posix(),
-        "backup": backup_abs.name if flat else backup_abs.relative_to(backup_root).as_posix(),
-    }
-    with man.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def setup_logging(log_file: Path | None, verbose: bool) -> logging.Logger:

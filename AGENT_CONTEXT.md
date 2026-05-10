@@ -149,8 +149,7 @@ Duplicate-skip summaries use **`dest/<year>/<original fname>`** for the `dest=` 
 | `--no-recurse` | Top-level files only under `--source`. |
 | `--skip-path` | Repeatable; skip subtree (posix-ish, no `..`). |
 | `--sort-files` | Sort all media paths before processing (deterministic order; memory + delay). |
-| `--silence-skipped` | Quieter logs for duplicate losers (still recorded in state/log). |
-| `--backup-dir`, `--flat-backup-names`, `--remove-backup-on-success` | Extra safety copies. |
+| `--silence-skipped` | Quieter logs for identical-dest skips (still recorded in state/log). |
 | `--min-year`, `--max-year` | Heuristic bounds. |
 | `--preserve-source-mtime` | Keep dest mtime as source when not aligning to chosen datetime. |
 | `--progress-every` | Progress log interval; `0` disables. |

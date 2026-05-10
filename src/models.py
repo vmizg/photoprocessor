@@ -162,9 +162,6 @@ class RunConfig:
     dedupe_scoring: bool
     no_recurse: bool
     skip_path_prefixes: tuple[str, ...]
-    backup_dir: Path | None
-    flat_backup_names: bool
-    remove_backup_on_success: bool
     preserve_source_mtime: bool
     silence_skipped: bool
     sort_files: bool
