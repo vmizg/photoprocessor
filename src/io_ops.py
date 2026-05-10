@@ -64,6 +64,85 @@ def files_identical_bytes(a: Path, b: Path) -> bool:
                 return True
 
 
+def resolve_organize_destination(
+    source_file: Path,
+    *,
+    fp_resolved: Path,
+    canonical_dest: Path,
+    dry_run_claims: dict[Path, Path] | None = None,
+) -> tuple[Path, str]:
+    """
+    Pick the destination path for one organize copy under ``canonical_dest``.
+
+    Returns ``(target, kind)`` where ``kind`` is:
+
+    - ``already_at_dest`` — resolved source equals canonical path (nothing to write).
+    - ``skip_identical`` — ``target`` already holds the same bytes; do not overwrite.
+    - ``copy`` — write to ``target`` (path does not exist yet for this session).
+
+    If something already exists at the canonical basename with **different** bytes, the next
+    free name ``stem_1``, ``stem_2``, … in the same folder is chosen (filesystem + optional
+    ``dry_run_claims`` reserve planned paths when nothing exists on disk yet).
+
+    ``dry_run_claims`` maps resolved dest path → resolved source path for destinations
+    “claimed” earlier in the same dry-run pass (so duplicate sources match without a disk copy).
+    """
+    cand0 = canonical_dest
+    try:
+        if cand0.resolve() == fp_resolved:
+            return cand0, "already_at_dest"
+    except OSError:
+        pass
+
+    parent = cand0.parent
+    stem = cand0.stem
+    suf = cand0.suffix
+
+    def key(p: Path) -> Path:
+        try:
+            return p.resolve()
+        except OSError:
+            return p
+
+    max_suffix = 1_000_000
+    for i in range(max_suffix):
+        cand = cand0 if i == 0 else parent / f"{stem}_{i}{suf}"
+        rk = key(cand)
+        try:
+            is_same_path = rk == fp_resolved
+        except OSError:
+            is_same_path = False
+        if is_same_path:
+            return cand, "already_at_dest"
+
+        if cand.is_file():
+            if rk != fp_resolved and files_identical_bytes(source_file, cand):
+                return cand, "skip_identical"
+            continue
+
+        if dry_run_claims is not None and rk in dry_run_claims:
+            occupied_by = dry_run_claims[rk]
+            try:
+                if rk != fp_resolved and files_identical_bytes(source_file, occupied_by):
+                    return cand, "skip_identical"
+            except OSError:
+                pass
+            continue
+
+        try:
+            if cand.exists():
+                continue
+        except OSError:
+            continue
+
+        return cand, "copy"
+
+    raise RuntimeError(
+        f"Could not allocate a destination name under {parent} "
+        f"for stem {stem!r} (attempted suffixes 0..{max_suffix})"
+    )
+
+
 _FILETIME_EPOCH_1970 = 116444736000000000
 
 
@@ -278,16 +357,6 @@ def _rel_matches_include_globs(rel_posix: str, patterns: tuple[str, ...]) -> boo
             if "/" not in rest and rel.match(rest):
                 return True
     return False
-
-
-def unique_superseded_name(dest: Path, stem: str, suffix: str) -> Path:
-    sup = dest / SUPERSEDED_SUBDIR
-    for n in range(10_000):
-        h = hashlib.sha256(f"{stem}{n}{datetime.now().timestamp()}".encode()).hexdigest()[:8]
-        cand = sup / f"{stem}_{h}{suffix}"
-        if not cand.exists():
-            return cand
-    return sup / f"{stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{suffix}"
 
 
 def iter_media_files(
@@ -576,8 +645,10 @@ def record_winner(
     target_relative: str,
     exif_original: str | None,
     filename: str,
+    materialized_timezone: str | None = None,
+    exif_timezone: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    d: dict[str, Any] = {
         "source_relative": source_relative,
         "score": score,
         "rule": rule,
@@ -590,3 +661,8 @@ def record_winner(
         "exif_original": exif_original,
         "filename": filename,
     }
+    if materialized_timezone:
+        d["materialized_timezone"] = materialized_timezone
+    if exif_timezone:
+        d["exif_timezone"] = exif_timezone
+    return d

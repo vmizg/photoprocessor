@@ -368,7 +368,7 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
         ),
         must_not_contain=("[filename_earlier_than_metadata]",),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="No new_created; copy keeps source CreationTime (dedupe incumbent wins later tie).",
+        dest_copy_created_after_note="No new_created; copy keeps source CreationTime (score 30).",
         dest_creation_time_touched=False,
         dest_copy_creation_after_iso=None,
         touch_outcome="untouched_same_as_source",
@@ -377,12 +377,11 @@ DRY_RUN_FILE_EXPECTATIONS: tuple[FileExpectation, ...] = (
         "z2/same.jpg",
         (),
         (
-            "SKIP duplicate:",
+            "SKIP already present (same file bytes)",
             "{current_year}/same.jpg",
-            "loses to incumbent",
         ),
         source_created_before_note="Source created= is filesystem ctime (new temp file, ~ test run).",
-        dest_copy_created_after_note="No destination file; duplicate slot already filled by z1/same.jpg.",
+        dest_copy_created_after_note="Second copy byte-identical to canonical dest (z1/same.jpg → same.jpg).",
         dest_creation_time_touched=False,
         source_never_copied_to_dest=True,
         dest_copy_creation_after_iso=None,
@@ -546,7 +545,11 @@ def _check_creation_expectations(
 
 
 def _observed_touch_outcome(block: str) -> str:
-    if "SKIP duplicate" in block:
+    if (
+        "SKIP duplicate" in block
+        or "SKIP identical slot" in block
+        or "SKIP already present (same file bytes)" in block
+    ):
         return "untouched_skipped_duplicate"
     if "set_created=" in block and "set_created=-" not in block:
         return "touched"
@@ -1610,6 +1613,28 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
                 errors.append(f"iter_media_files two include globs expected 2, got {n_pair}")
 
         # --- state JSON ---
+        from src.dedupe import expand_slots_to_canonical, slots_for_json_export
+
+        exp_try = slots_for_json_export(
+            {
+                "2020/photo.jpg": {
+                    "canonical_slot": "2020/photo.jpg",
+                    "winner": {
+                        "target_relative": "2020/Photo.JPG",
+                        "filename": "Photo.JPG",
+                        "score": 40,
+                        "sequence": 1,
+                    },
+                    "history": [],
+                }
+            }
+        )
+        if "2020/Photo.JPG" not in exp_try:
+            errors.append("slots_for_json_export should use target_relative casing for outer key")
+        exp_round = expand_slots_to_canonical(exp_try)
+        if sys.platform == "win32" and "2020/photo.jpg" not in exp_round:
+            errors.append("expand_slots_to_canonical should restore canonical keys on Windows")
+
         with tempfile.TemporaryDirectory(prefix="op_state_") as ts:
             sp = Path(ts) / "state.json"
             st = op.default_state(Path("/s"), Path("/d"))
@@ -1646,6 +1671,87 @@ def run_organize_photos_import_library_tests(errors: list[str]) -> None:
     finally:
         if pushed and sys.path and sys.path[0] == sd:
             sys.path.pop(0)
+
+
+def run_neighbor_tz_tests(errors: list[str]) -> None:
+    """Folder neighbor timezone inference (no GPS): bracket + alpha + UTC-between."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.neighbor_tz as nz
+    from src.models import ExifCaptureInfo, HeuristicConfig, NeighborInferredTz
+
+    cfg = HeuristicConfig(min_year=1980, max_year=2035)
+    now = datetime(2020, 6, 15, 12, 0, 0)
+    T = timezone(timedelta(hours=2))
+
+    with tempfile.TemporaryDirectory(prefix="op_ntz_") as tmp:
+        root = Path(tmp)
+        trip = root / "trip"
+        trip.mkdir()
+        b = trip / "b.jpg"
+        c = trip / "c.jpg"
+        d = trip / "d.jpg"
+        cache = {
+            b: ExifCaptureInfo(datetime(2020, 1, 1, 10, 0, 0, tzinfo=T)),
+            c: ExifCaptureInfo(datetime(2020, 1, 1, 11, 0, 0)),
+            d: ExifCaptureInfo(datetime(2020, 1, 1, 12, 0, 0, tzinfo=T)),
+        }
+        m = nz.build_neighbor_tz_map([d, b, c], root, cache, now, cfg)
+        rel_c = c.relative_to(root).as_posix()
+        if rel_c not in m:
+            errors.append(f"neighbor tz: expected hit for {rel_c}, got {m!r}")
+        elif m[rel_c].fixed_offset_total_seconds != 7200 or m[rel_c].iana is not None:
+            errors.append(f"neighbor tz: wrong spec {m[rel_c]!r}")
+
+        cache2 = {
+            b: ExifCaptureInfo(datetime(2020, 1, 1, 10, 0, 0, tzinfo=T)),
+            c: ExifCaptureInfo(datetime(2020, 1, 1, 10, 0, 0)),
+            d: ExifCaptureInfo(datetime(2020, 1, 1, 12, 0, 0, tzinfo=T)),
+        }
+        m2 = nz.build_neighbor_tz_map([b, c, d], root, cache2, now, cfg)
+        if rel_c in m2:
+            errors.append("neighbor tz: should not infer when UTC not strictly between")
+
+        cache_g = {
+            b: ExifCaptureInfo(datetime(2020, 1, 1, 10, 0, 0, tzinfo=T)),
+            c: ExifCaptureInfo(
+                datetime(2020, 1, 1, 11, 0, 0),
+                gps_timezone_name="Europe/Berlin",
+            ),
+            d: ExifCaptureInfo(datetime(2020, 1, 1, 12, 0, 0, tzinfo=T)),
+        }
+        m3 = nz.build_neighbor_tz_map([b, c, d], root, cache_g, now, cfg)
+        if rel_c in m3:
+            errors.append("neighbor tz: skip target with gps_timezone_name")
+
+        T1 = timezone(timedelta(hours=1))
+        cache_mz = {
+            b: ExifCaptureInfo(datetime(2020, 1, 1, 10, 0, 0, tzinfo=T)),
+            c: ExifCaptureInfo(datetime(2020, 1, 1, 11, 0, 0)),
+            d: ExifCaptureInfo(datetime(2020, 1, 1, 12, 0, 0, tzinfo=T1)),
+        }
+        m5 = nz.build_neighbor_tz_map([b, c, d], root, cache_mz, now, cfg)
+        if rel_c in m5:
+            errors.append("neighbor tz: skip mismatched anchor zones")
+
+    from src.rules import decide_actions as _decide_actions
+    from src.rules import primary_time_action as _primary_time_action
+
+    acts_n = _decide_actions(
+        [],
+        "c.jpg",
+        now,
+        now,
+        datetime(2020, 1, 1, 11, 0, 0),
+        now,
+        cfg,
+        neighbor_inferred_tz=NeighborInferredTz(fixed_offset_total_seconds=7200),
+    )
+    prim = _primary_time_action(acts_n)
+    if prim is None or prim.kind != "neighbor_folder_tz_inference":
+        errors.append(
+            f"neighbor tz: decide_actions expected neighbor_folder_tz_inference, got {prim!r}"
+        )
 
 
 def run_cli_edge_case_tests(errors: list[str]) -> None:
@@ -1708,7 +1814,7 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
                 f"expected 3 media files (top jpg, nested jpg, mp4), got:\n{out_m[-700:]}"
             )
 
-        # --silence-skipped: do not print blocks for skipped duplicates (dedupe scoring on by default)
+        # --silence-skipped: do not print verbose blocks when skipping identical dest
         src_s = base / "src_silence"
         dest_s = base / "dest_silence"
         src_s.mkdir()
@@ -1720,8 +1826,14 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
         )
         if code_s != 0:
             errors.append(f"--silence-skipped exit {code_s}")
-        if "SKIP duplicate:" in out_s:
-            errors.append("--silence-skipped should not print SKIP duplicate blocks")
+        if (
+            "SKIP duplicate:" in out_s
+            or "SKIP identical slot" in out_s
+            or "SKIP already present (same file bytes)" in out_s
+        ):
+            errors.append(
+                "--silence-skipped should not print skip blocks for identical / duplicate losers"
+            )
         if "Skipped duplicate:" in out_s:
             errors.append("--silence-skipped should not log Skipped duplicate at INFO level")
 
@@ -1747,7 +1859,7 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
                 f"--include-glob **/*.mp4 expected 1 file, got:\n{out_ig[-700:]}"
             )
 
-        # Windows: dedupe scoring should collapse case/Unicode-equivalent slot names.
+        # Windows: same logical basename (case/Unicode) should hit identical-skip, not _1 + _2 pair.
         if sys.platform == "win32":
             src4 = base / "src4"
             dest4 = base / "dest4"
@@ -1758,9 +1870,9 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
             code_w, out_w = run_organizer(src4, dest4, True, base / "st4.json")
             if code_w != 0:
                 errors.append(f"windows slot normalization case exit {code_w}")
-            if "SKIP duplicate:" not in out_w:
+            if "SKIP duplicate:" not in out_w and "SKIP already present (same file bytes)" not in out_w:
                 errors.append(
-                    "windows slot normalization: expected duplicate skip for Unicode/case equivalent names"
+                    "windows slot normalization: expected skip for Unicode/case equivalent names"
                 )
 
         # Re-run idempotency (no-op on second run without relying on state to decide duplicates):
@@ -1796,6 +1908,94 @@ def run_cli_edge_case_tests(errors: list[str]) -> None:
             )
         if (dest_id / "_superseded").exists():
             errors.append("idempotency: _superseded should not be created on exact rerun")
+
+        # Pre-existing dest file with different bytes: organizer must never overwrite canonical;
+        # source copy lands at plain_1.jpg.
+        src_pre = base / "src_preexist"
+        dest_pre = base / "dest_preexist"
+        src_pre.mkdir()
+        dest_pre.mkdir()
+        ypre = datetime.now().year
+        write_dummy_photo(src_pre / "plain.jpg")
+        want_src_plain = (src_pre / "plain.jpg").read_bytes()
+        ydir_pre = dest_pre / str(ypre)
+        ydir_pre.mkdir(parents=True)
+        (ydir_pre / "plain.jpg").write_bytes(b"\xff\xd8\xff\xd9diff")
+        st_pre = base / "st_preexist.json"
+        code_pre, _ = run_organizer(src_pre, dest_pre, False, st_pre)
+        if code_pre != 0:
+            errors.append(f"preexist byte mismatch run exit {code_pre}")
+        if (ydir_pre / "plain.jpg").read_bytes() != b"\xff\xd8\xff\xd9diff":
+            errors.append("preexist: canonical dest should keep original bytes (no overwrite)")
+        alt_pre = ydir_pre / "plain_1.jpg"
+        if not alt_pre.is_file():
+            errors.append("preexist: new copy should be plain_1.jpg when canonical differs by bytes")
+        elif alt_pre.read_bytes() != want_src_plain:
+            errors.append("preexist: plain_1.jpg should match source bytes")
+        if (dest_pre / "_superseded").exists():
+            errors.append("preexist: should not use _superseded folder")
+        # Same basename on disk under same year folder, different bytes: second gets _1 suffix.
+        src_tie = base / "src_tie_bytes"
+        dest_tie = base / "dest_tie_bytes"
+        src_tie.mkdir()
+        dest_tie.mkdir()
+        (src_tie / "a").mkdir()
+        (src_tie / "b").mkdir()
+        write_dummy_photo(src_tie / "a" / "x.jpg")
+        (src_tie / "b" / "x.jpg").write_bytes(b"\xff\xd8\xff\xd9\x77")
+        st_tie = base / "st_tie_bytes.json"
+        code_tie, _out_tie = run_organizer(src_tie, dest_tie, False, st_tie)
+        if code_tie != 0:
+            errors.append(f"tie different bytes exit {code_tie}")
+        yt = datetime.now().year
+        y_tie = dest_tie / str(yt)
+        if not (y_tie / "x.jpg").is_file():
+            errors.append("tie different bytes: expected canonical x.jpg")
+        if not (y_tie / "x_1.jpg").is_file():
+            errors.append("tie different bytes: expected first copy at x_1.jpg")
+        elif (y_tie / "x_1.jpg").read_bytes() == (y_tie / "x.jpg").read_bytes():
+            errors.append("tie different bytes: x.jpg and x_1.jpg should differ")
+        dup_tie = st_tie.with_name("duplicates.json")
+        if dup_tie.is_file():
+            rep_tie = json.loads(dup_tie.read_text(encoding="utf-8"))
+            for d in rep_tie.get("duplicates") or []:
+                if d.get("reason") == "skipped_duplicate_lower_or_equal_score":
+                    errors.append(
+                        f"tie different bytes: unexpected duplicate skip {d!r}"
+                    )
+        dup_pre = st_pre.with_name("duplicates.json")
+        if dup_pre.is_file():
+            rep_pre = json.loads(dup_pre.read_text(encoding="utf-8"))
+            for d in rep_pre.get("duplicates") or []:
+                if d.get("reason") == "skipped_duplicate_lower_or_equal_score":
+                    errors.append(
+                        f"preexist: should not duplicate-skip on byte mismatch: {d!r}"
+                    )
+
+        # Same bytes as pre-existing dest: skipped_identical_to_dest (not score loss).
+        src_same = base / "src_preexist_same"
+        dest_same = base / "dest_preexist_same"
+        src_same.mkdir()
+        dest_same.mkdir()
+        write_dummy_photo(src_same / "keep.jpg")
+        ys = datetime.now().year
+        sd = dest_same / str(ys)
+        sd.mkdir(parents=True)
+        shutil.copy2(src_same / "keep.jpg", sd / "keep.jpg")
+        st_same = base / "st_preexist_same.json"
+        code_same, _ = run_organizer(src_same, dest_same, False, st_same)
+        if code_same != 0:
+            errors.append(f"preexist identical run exit {code_same}")
+        dup_same = st_same.with_name("duplicates.json")
+        if not dup_same.is_file():
+            errors.append("preexist identical: expected duplicates.json")
+        else:
+            rep_same = json.loads(dup_same.read_text(encoding="utf-8"))
+            dups_same = rep_same.get("duplicates") or []
+            if len(dups_same) != 1 or dups_same[0].get("reason") != "skipped_identical_to_dest":
+                errors.append(
+                    f"preexist identical: expected one skipped_identical, got {dups_same!r}"
+                )
 
 
 def _configure_stdio() -> None:
@@ -1889,7 +2089,7 @@ def main() -> int:
                 if (
                     len(dups) != 1
                     or dups[0].get("source_relative") != "z2/same.jpg"
-                    or dups[0].get("reason") != "skipped_duplicate_lower_or_equal_score"
+                    or dups[0].get("reason") != "skipped_identical_to_dest"
                 ):
                     errors.append(f"duplicates.json entries unexpected: {dups!r}")
 
@@ -1909,6 +2109,14 @@ def main() -> int:
 
     print("\n=== organize_photos import library tests ===\n")
     run_organize_photos_import_library_tests(errors)
+    if errors:
+        print("\nFAILED:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+
+    print("\n=== neighbor TZ inference ===\n")
+    run_neighbor_tz_tests(errors)
     if errors:
         print("\nFAILED:", file=sys.stderr)
         for e in errors:

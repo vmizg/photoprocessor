@@ -72,6 +72,18 @@ class Action:
 
 
 @dataclass(frozen=True)
+class NeighborInferredTz:
+    """
+    Folder neighbor heuristic: attach timezone to naive EXIF from bracketing anchors.
+
+    Exactly one of ``iana`` or ``fixed_offset_total_seconds`` should be set.
+    """
+
+    iana: str | None = None
+    fixed_offset_total_seconds: int | None = None
+
+
+@dataclass(frozen=True)
 class ExifCaptureInfo:
     """EXIF read result: best datetime plus optional OffsetTime / GPS hints."""
 
@@ -115,6 +127,8 @@ class FileFacts:
     exif_capture_hint: str | None = None
     #: IANA zone from GPS when EXIF had no offset (see :class:`ExifCaptureInfo`).
     exif_gps_timezone_name: str | None = None
+    #: When naive EXIF had no GPS zone, optional same-folder neighbor inference (see :mod:`src.neighbor_tz`).
+    neighbor_inferred_tz: NeighborInferredTz | None = None
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .datetime_policy import (
     TZ_NAIVE_VS_MODIFIED_EQUIV_MAX,
+    apply_neighbor_inferred_tz,
     attach_gps_iana_zone_to_naive_exif,
     exif_ambiguous_vs_modified,
     exif_correlates_with_clock_filename,
@@ -24,7 +25,7 @@ from .extractors import (
     extract_filename_datetime_entries,
     match_structured_path,
 )
-from .models import Action, Decision, FileFacts, HeuristicConfig
+from .models import Action, Decision, FileFacts, HeuristicConfig, NeighborInferredTz
 
 
 def decide_actions(
@@ -38,6 +39,7 @@ def decide_actions(
     *,
     exif_gps_timezone_name: str | None = None,
     path_anchor_year: int | None = None,
+    neighbor_inferred_tz: NeighborInferredTz | None = None,
 ) -> list[Action]:
     actions: list[Action] = []
     # Host-local normalization for filesystem / plausibility; stem correlation uses raw EXIF
@@ -77,6 +79,19 @@ def decide_actions(
                 )
             )
             return actions
+
+        if neighbor_inferred_tz is not None:
+            aware_nb = apply_neighbor_inferred_tz(exif_as_read, neighbor_inferred_tz)
+            if aware_nb is not None and aware_nb.tzinfo is not None:
+                actions.append(
+                    Action(
+                        "neighbor_folder_tz_inference",
+                        "Naive EXIF strictly between same-timezone folder neighbors in alphabetical "
+                        "order (UTC instants), with minimum anchor spacing; GPS did not yield a zone.",
+                        new_created=aware_nb,
+                    )
+                )
+                return actions
 
     fn_entries = [
         (naive_local(d), inc) for d, inc in extract_filename_datetime_entries(filename, now, cfg)
@@ -329,6 +344,7 @@ def decide(
         cfg,
         exif_gps_timezone_name=facts.exif_gps_timezone_name,
         path_anchor_year=path_anchor_year,
+        neighbor_inferred_tz=facts.neighbor_inferred_tz,
     )
     return Decision.from_actions(planned)
 
@@ -367,6 +383,8 @@ def confidence_score(planned: list[Action], filename: str) -> tuple[int, str]:
     kind = primary.kind
     if kind == "embedded_timezone_authoritative":
         return 100, kind
+    if kind == "neighbor_folder_tz_inference":
+        return 96, kind
     if kind == "exif_earlier_than_metadata":
         return 100, kind
     if kind == "structured_path_align_created":

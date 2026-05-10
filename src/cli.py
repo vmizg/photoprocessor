@@ -1,4 +1,4 @@
-"""Argument parsing and main orchestration (collect → decide → dedupe → execute)."""
+"""Argument parsing and main orchestration (collect → decide → allocate dest → execute)."""
 
 from __future__ import annotations
 
@@ -8,50 +8,53 @@ import os
 import shutil
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .dedupe import migrate_state_slot_keys, slot_key_for
+from .dedupe import (
+    expand_slots_to_canonical,
+    migrate_state_slot_keys,
+    slot_key_for,
+    slot_target_display,
+)
 from .datetime_policy import filesystem_instant_for_rule, normalize_iana_timezone_name
 from .extractors import (
     path_calendar_divergence_hint,
     read_exif_capture,
     rel_parts_for_path_dating,
 )
+from .neighbor_tz import build_neighbor_tz_map
 from .io_ops import (
     DEFAULT_LOG_ARG_SENTINEL,
     append_backup_manifest,
     backup_path_for,
-    dest_path_from_slot_relative,
     emit_to_both,
     file_times,
     is_prior_organizer_output,
     iter_media_files,
     normalize_include_glob_arg,
     normalize_skip_path_arg,
-    record_skip_duplicate,
     record_skip_identical,
     record_winner,
     resolve_log_path_arg,
-    files_identical_bytes,
+    resolve_organize_destination,
     set_creation_time_windows,
     setup_logging,
-    unique_superseded_name,
 )
 from .models import (
     FileFacts,
     HeuristicConfig,
-    MYSTERY_INCUMBENT_SCORE,
-    SUPERSEDED_SUBDIR,
 )
 from .rules import confidence_score, decide_actions, primary_time_action
 from .state_repo import (
+    StateFlushBatcher,
     default_state,
     dt_iso,
+    iso_timezone_label,
     load_state_file,
     save_json_atomic,
-    save_state_atomic,
 )
 
 
@@ -137,15 +140,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="IANA",
         help="When embedded capture metadata exists but has no timezone (and GPS did not yield one), "
-        "interpret that capture wall time in this IANA timezone instead of the local machine timezone. "
+        "interpret that capture wall time in this IANA timezone instead of the local machine timezone, "
+        "only after same-folder neighbor inference (alphabetical bracket + UTC-between anchors) does not apply. "
         'Example: --fallback-timezone "Europe/Berlin". Default: use local machine timezone.',
     )
     ap.add_argument(
         "--state-file",
         type=Path,
         default=None,
-        help="JSON state (slots, scores, skipped). Default: <dest>/organize_state.json. "
+        help="JSON state (per-dest slots, skipped-identical). Default: <dest>/organize_state.json. "
         "When the organizer runs (not --dry-run), duplicates.json is written beside this file.",
+    )
+    ap.add_argument(
+        "--state-save-every",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Persist organize_state.json after every N in-memory state updates (skip/slot). "
+        "Default 50 avoids rewriting a megabyte JSON on every file when skipped[] grows. "
+        "Use 1 for maximum crash safety (slow on large state). Always flushes once at end of run.",
     )
     ap.add_argument(
         "--no-recurse",
@@ -182,14 +195,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--silence-skipped",
         action="store_true",
-        help="Do not print per-file 4-line summaries for files skipped as duplicate losers. "
+        help="Do not print per-file 4-line summaries for files skipped as already present (identical). "
         "They are still recorded in organize_state.json and in the log file.",
     )
     ap.add_argument(
         "--sort-files",
         action="store_true",
         help="Collect all media paths, sort case-insensitively, then process. "
-        "Gives deterministic tie-break order for duplicate slots, but on very large folders "
+        "Gives deterministic order for same-name collisions (suffix allocation), but on very large folders "
         "this uses a lot of memory and delays the first file until the full list is built. "
         "Default is streaming walk order (faster startup).",
     )
@@ -251,9 +264,6 @@ def main(argv: list[str] | None = None) -> int:
             "Optional --backup-dir keeps an extra copy of each source file elsewhere."
         )
 
-    # Dedupe scoring is always enabled (legacy collision suffix mode removed).
-    dedupe = True
-
     if args.state_file is not None:
         state_path_resolved: Path | None = args.state_file.resolve()
     else:
@@ -262,6 +272,10 @@ def main(argv: list[str] | None = None) -> int:
     effective_state_path: Path | None = None
     if state_path_resolved is not None and not args.dry_run:
         effective_state_path = state_path_resolved
+
+    state_batcher = StateFlushBatcher(
+        effective_state_path, int(args.state_save_every)
+    )
 
     state: dict[str, Any]
     if state_path_resolved is not None and state_path_resolved.is_file():
@@ -280,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         state = default_state(source, dest)
     state.setdefault("slots", {})
     state.setdefault("skipped", [])
+    if isinstance(state.get("slots"), dict):
+        state["slots"] = expand_slots_to_canonical(state["slots"])
     migrate_state_slot_keys(state)
     skipped_before_run = len(state["skipped"])
     state["source"] = str(source)
@@ -293,9 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     backup_root_res = Path(args.backup_dir).resolve() if args.backup_dir else None
 
     log.info(
-        "Duplicate handling: canonical dest/<YEAR>/<name>; higher score wins. "
-        "Tie -> first processed wins. Losers stay in source. Superseded: %s",
-        dest.joinpath(SUPERSEDED_SUBDIR),
+        "Destination names: <dest>/<YEAR>/<original name>. "
+        "If that path exists with different file bytes, use <name>_1, _2, ... in the same year folder. "
+        "Identical bytes: skip copy (idempotent re-run).",
     )
 
     if args.no_recurse:
@@ -317,43 +333,49 @@ def main(argv: list[str] | None = None) -> int:
             args.year,
         )
 
-    if args.sort_files:
-        log.info(
-            "Collecting media paths under %s for sorted processing (large trees: high memory, delay before first file)...",
-            source,
-        )
-        _t_enum = time.perf_counter()
-        _all_media = list(
-            iter_media_files(
-                source,
-                recurse=not args.no_recurse,
-                skip_path_prefixes=skip_paths,
-                include_globs=include_globs,
-            )
-        )
-        log.info(
-            "Found %s media files in %.2fs; sorting...",
-            len(_all_media),
-            time.perf_counter() - _t_enum,
-        )
-        _t_sort = time.perf_counter()
-        media_iter = iter(sorted(_all_media, key=lambda p: str(p).lower()))
-        log.info("Sort finished in %.2fs; starting main loop.", time.perf_counter() - _t_sort)
-    else:
-        log.info(
-            "Streaming media files in walk order (no full sort). "
-            "Use --sort-files if you need deterministic duplicate tie-break order."
-        )
-        media_iter = iter_media_files(
+    log.info(
+        "Collecting media paths under %s (full EXIF read follows for per-folder neighbor TZ inference)...",
+        source,
+    )
+    _t_enum = time.perf_counter()
+    all_media = list(
+        iter_media_files(
             source,
             recurse=not args.no_recurse,
             skip_path_prefixes=skip_paths,
             include_globs=include_globs,
         )
+    )
+    log.info(
+        "Found %s media files in %.2fs.",
+        len(all_media),
+        time.perf_counter() - _t_enum,
+    )
+    if args.sort_files:
+        _t_sort = time.perf_counter()
+        all_media.sort(key=lambda p: str(p).lower())
+        log.info(
+            "Sorted case-insensitively in %.2fs (--sort-files).",
+            time.perf_counter() - _t_sort,
+        )
+    else:
+        log.info(
+            "Processing in directory-walk order "
+            "(use --sort-files for deterministic order when the same year/name needs _1, _2 suffixes).",
+        )
+    _t_exif = time.perf_counter()
+    exif_cache = {p: read_exif_capture(p) for p in all_media}
+    neighbor_map = build_neighbor_tz_map(all_media, source, exif_cache, now, cfg)
+    log.info(
+        "EXIF preload + neighbor TZ map in %.2fs (%s inferred).",
+        time.perf_counter() - _t_exif,
+        len(neighbor_map),
+    )
 
     _loop_started = time.perf_counter()
     _file_index = 0
-    for fpath in media_iter:
+    dry_run_claims: dict[Path, Path] = {}
+    for fpath in all_media:
         _file_index += 1
         if args.progress_every > 0 and _file_index % args.progress_every == 0:
             try:
@@ -387,10 +409,16 @@ def main(argv: list[str] | None = None) -> int:
         # --- Stage 1: collect facts ---
         rel_parts_dating = rel_parts_for_path_dating(fpath, source)
         fname = rel.name
+        if sys.platform == "win32":
+            # NFC aligns decomposed vs precomposed Unicode; preserve original casing on disk.
+            dest_basename = unicodedata.normalize("NFC", fname)
+        else:
+            dest_basename = fname
         created, modified = file_times(fpath)
-        exif_cap = read_exif_capture(fpath)
+        exif_cap = exif_cache[fpath]
         exif_dt = exif_cap.best_datetime
         exif_hint = exif_cap.hint_string()
+        nb_tz = neighbor_map.get(rel.as_posix())
         facts = FileFacts(
             rel_parts=tuple(rel_parts_dating),
             filename=fname,
@@ -399,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             exif_original=exif_dt,
             exif_capture_hint=exif_hint,
             exif_gps_timezone_name=exif_cap.gps_timezone_name,
+            neighbor_inferred_tz=nb_tz,
         )
 
         # --- Stage 2: decide ---
@@ -412,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg,
             exif_gps_timezone_name=facts.exif_gps_timezone_name,
             path_anchor_year=args.year,
+            neighbor_inferred_tz=nb_tz,
         )
 
         primary = primary_time_action(planned)
@@ -440,139 +470,58 @@ def main(argv: list[str] | None = None) -> int:
 
         move_year = final_created.year
         score, rule_key = confidence_score(planned, fname)
+        tz_materialized = iso_timezone_label(fs_materialized)
+        if tz_materialized is None and primary is not None:
+            tz_materialized = iso_timezone_label(primary.new_created)
+        tz_exif = iso_timezone_label(exif_dt)
         year_dir = dest / f"{move_year}"
 
-        # --- Stage 3–4: dedupe arbitration + execute ---
-        if dedupe:
-            target = year_dir / fname
-            sk = slot_key_for(move_year, fname)
-            slots: dict[str, Any] = state["slots"]
-            if target.is_file() and sk not in slots:
-                pc, pm = file_times(target)
-                slots[sk] = {
-                    "winner": {
-                        "source_relative": "<dest_pre_existing>",
-                        "score": MYSTERY_INCUMBENT_SCORE,
-                        "rule": "pre_existing_on_dest",
-                        "sequence": 0,
-                        "original_created": dt_iso(pc),
-                        "original_modified": dt_iso(pm),
-                        "final_created": dt_iso(pc),
-                        "final_modified": dt_iso(pm),
-                        "target_relative": sk,
-                        "exif_original": None,
-                        "filename": fname,
-                    },
-                    "history": [],
-                }
-                if effective_state_path:
-                    save_state_atomic(effective_state_path, state)
+        canonical = year_dir / dest_basename
+        target, dest_kind = resolve_organize_destination(
+            fpath,
+            fp_resolved=fp_res,
+            canonical_dest=canonical,
+            dry_run_claims=dry_run_claims if args.dry_run else None,
+        )
 
-            incumbent = slots.get(sk)
-            if incumbent is not None:
-                w = incumbent["winner"]
-                inc_score = int(w["score"])
-                inc_seq = int(w["sequence"])
-                lose = score < inc_score or (
-                    score == inc_score and seq >= inc_seq
+        if dest_kind == "already_at_dest":
+            processed += 1
+            continue
+
+        if dest_kind == "skip_identical":
+            rec_id = record_skip_identical(
+                source_relative=rel.as_posix(),
+                competing_target=slot_target_display(move_year, target.name),
+                incumbent_source="<dest_already_present>",
+                sequence=seq,
+            )
+            state["skipped"].append(rec_id)
+            dest_text = f"{dest.name}/{move_year}/{target.name}".replace("\\", "/")
+            outcome_text = "SKIP already present (same file bytes)"
+            if not args.silence_skipped:
+                emit_to_both(
+                    out_stream=out_stream,
+                    run_log=run_log,
+                    rel_posix=rel.as_posix(),
+                    created=created,
+                    modified=modified,
+                    exif_original=exif_dt,
+                    exif_capture_hint=exif_hint,
+                    planned=planned,
+                    materialized_created=fs_materialized,
+                    dest_text=dest_text,
+                    outcome_text=outcome_text,
                 )
-                if lose:
-                    rec = record_skip_duplicate(
-                        source_relative=rel.as_posix(),
-                        competing_target=sk,
-                        incumbent_score=inc_score,
-                        candidate_score=score,
-                        candidate_rule=rule_key,
-                        incumbent_source=w.get("source_relative"),
-                        sequence=seq,
-                    )
-                    state["skipped"].append(rec)
-                    dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
-                    outcome_text = (
-                        f"SKIP duplicate: score {score} loses to incumbent {inc_score} (slot {sk})"
-                    )
-                    if not args.silence_skipped:
-                        emit_to_both(
-                            out_stream=out_stream,
-                            run_log=run_log,
-                            rel_posix=rel.as_posix(),
-                            created=created,
-                            modified=modified,
-                            exif_original=exif_dt,
-                            exif_capture_hint=exif_hint,
-                            planned=planned,
-                            materialized_created=fs_materialized,
-                            dest_text=dest_text,
-                            outcome_text=outcome_text,
-                        )
-                    if args.silence_skipped:
-                        log.debug("Skipped duplicate: %s", rec)
-                    else:
-                        log.info("Skipped duplicate: %s", rec)
-                    if effective_state_path:
-                        save_state_atomic(effective_state_path, state)
-                    processed += 1
-                    continue
+            if args.silence_skipped:
+                log.debug("Skip identical dest: %s", rec_id)
+            else:
+                log.info("Skip copy: identical to existing dest %s", target)
+            state_batcher.after_mutation(state)
+            processed += 1
+            continue
 
-                tr = str(w.get("target_relative", sk))
-                inc_path = dest_path_from_slot_relative(dest, tr)
-                if inc_path.is_file() and fp_res != inc_path.resolve():
-                    if files_identical_bytes(fpath, inc_path):
-                        rec_id = record_skip_identical(
-                            source_relative=rel.as_posix(),
-                            competing_target=sk,
-                            incumbent_source=w.get("source_relative"),
-                            sequence=seq,
-                        )
-                        state["skipped"].append(rec_id)
-                        dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
-                        outcome_text = "SKIP identical dest (same file bytes)"
-                        emit_to_both(
-                            out_stream=out_stream,
-                            run_log=run_log,
-                            rel_posix=rel.as_posix(),
-                            created=created,
-                            modified=modified,
-                            exif_original=exif_dt,
-                            exif_capture_hint=exif_hint,
-                            planned=planned,
-                            materialized_created=fs_materialized,
-                            dest_text=dest_text,
-                            outcome_text=outcome_text,
-                        )
-                        log.info("Skip supersede: identical to dest %s", inc_path)
-                        if effective_state_path:
-                            save_state_atomic(effective_state_path, state)
-                        processed += 1
-                        continue
-                    if not args.dry_run:
-                        (dest / SUPERSEDED_SUBDIR).mkdir(parents=True, exist_ok=True)
-                        sup = unique_superseded_name(
-                            dest, inc_path.stem, inc_path.suffix
-                        )
-                        shutil.move(str(inc_path), str(sup))
-                        hist = {
-                            "action": "superseded",
-                            "source_relative": w.get("source_relative"),
-                            "score": inc_score,
-                            "rule": w.get("rule"),
-                            "moved_to": sup.relative_to(dest).as_posix(),
-                            "replaced_by_sequence": seq,
-                        }
-                        incumbent.setdefault("history", []).append(hist)
-                        log.info("Superseded incumbent -> %s", sup)
-                        if effective_state_path:
-                            save_state_atomic(effective_state_path, state)
-                    else:
-                        hist = {
-                            "action": "superseded_dry_run",
-                            "source_relative": w.get("source_relative"),
-                            "score": inc_score,
-                            "rule": w.get("rule"),
-                            "replaced_by_sequence": seq,
-                        }
-                        incumbent.setdefault("history", []).append(hist)
-        # (legacy suffix-on-collision mode removed)
+        if args.dry_run:
+            dry_run_claims[target.resolve()] = fp_res
 
         if target.resolve() == fp_res:
             processed += 1
@@ -600,7 +549,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             log.info("DRY-RUN would copy %s -> %s", rel.as_posix(), target)
             slots = state["slots"]
-            sk = slot_key_for(move_year, fname)
+            out_name = target.name
+            sk = slot_key_for(move_year, out_name)
             wrec = record_winner(
                 source_relative=rel.as_posix(),
                 score=score,
@@ -610,49 +560,18 @@ def main(argv: list[str] | None = None) -> int:
                 original_modified=dt_iso(modified),
                 final_created=dt_iso(final_created),
                 final_modified=dt_iso(modified),
-                target_relative=sk,
+                target_relative=slot_target_display(move_year, out_name),
                 exif_original=dt_iso(exif_dt),
                 filename=fname,
+                materialized_timezone=tz_materialized,
+                exif_timezone=tz_exif,
             )
             prev = slots.get(sk, {})
             slots[sk] = {
+                "canonical_slot": sk,
                 "winner": wrec,
                 "history": list(prev.get("history", [])),
             }
-            processed += 1
-            continue
-
-        # Pre-copy idempotency: if the canonical target already exists and is byte-identical
-        # to the source, do nothing (stronger than matching filesystem timestamps).
-        if target.is_file() and fp_res != target.resolve() and files_identical_bytes(
-            fpath, target
-        ):
-            rec_id = record_skip_identical(
-                source_relative=rel.as_posix(),
-                competing_target=slot_key_for(move_year, fname),
-                incumbent_source="<dest_already_present>",
-                sequence=seq,
-            )
-            state["skipped"].append(rec_id)
-            dest_text = f"{dest.name}/{move_year}/{fname}".replace("\\", "/")
-            outcome_text = "SKIP already present (same file bytes)"
-            if not args.silence_skipped:
-                emit_to_both(
-                    out_stream=out_stream,
-                    run_log=run_log,
-                    rel_posix=rel.as_posix(),
-                    created=created,
-                    modified=modified,
-                    exif_original=exif_dt,
-                    exif_capture_hint=exif_hint,
-                    planned=planned,
-                    materialized_created=fs_materialized,
-                    dest_text=dest_text,
-                    outcome_text=outcome_text,
-                )
-            log.info("Skip copy: identical to existing dest %s", target)
-            if effective_state_path:
-                save_state_atomic(effective_state_path, state)
             processed += 1
             continue
 
@@ -707,7 +626,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             log.info("OK copy %s -> %s", rel.as_posix(), target)
 
-            sk = slot_key_for(archive_year, fname)
+            out_name = target.name
+            sk = slot_key_for(archive_year, out_name)
             wrec = record_winner(
                 source_relative=rel.as_posix(),
                 score=score,
@@ -717,15 +637,17 @@ def main(argv: list[str] | None = None) -> int:
                 original_modified=dt_iso(modified),
                 final_created=dt_iso(fc),
                 final_modified=dt_iso(fm),
-                target_relative=sk,
+                target_relative=slot_target_display(archive_year, out_name),
                 exif_original=dt_iso(exif_dt),
                 filename=fname,
+                materialized_timezone=tz_materialized,
+                exif_timezone=tz_exif,
             )
             slot_entry = state["slots"].get(sk, {"history": []})
             slot_entry["winner"] = wrec
+            slot_entry["canonical_slot"] = sk
             state["slots"][sk] = slot_entry
-            if effective_state_path:
-                save_state_atomic(effective_state_path, state)
+            state_batcher.after_mutation(state)
 
             if (
                 args.remove_backup_on_success
@@ -747,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
                     log.error("Could not remove partial copy %s: %s", target, ue)
 
         processed += 1
+
+    state_batcher.end(state)
 
     if path_review_count > 0:
         review_msg = (
@@ -782,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             save_json_atomic(dup_path, report)
             log.info(
-                "Wrote duplicate report (%s skipped this run) -> %s",
+                "Wrote duplicates.json (%s skipped-as-identical this run) -> %s",
                 len(session_dupes),
                 dup_path,
             )

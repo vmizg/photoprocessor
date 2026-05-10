@@ -25,7 +25,12 @@ from .datetime_policy import (
     infer_timezone_name_from_gps,
     naive_local,
 )
-from .dedupe import migrate_state_slot_keys, normalize_slot_key_for_dedupe, slot_key_for
+from .dedupe import (
+    migrate_state_slot_keys,
+    normalize_slot_key_for_dedupe,
+    slot_key_for,
+    slot_target_display,
+)
 from .extractors import (
     extract_filename_datetime_entries,
     match_structured_path,
@@ -115,6 +120,7 @@ __all__ = [
     "save_json_atomic",
     "save_state_atomic",
     "slot_key_for",
+    "slot_target_display",
     "try_exif_datetime_original",
     "unique_dest",
 ]

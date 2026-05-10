@@ -8,7 +8,7 @@ import re
 import argparse
 from datetime import datetime, timedelta, timezone, tzinfo
 
-from .models import HeuristicConfig
+from .models import HeuristicConfig, NeighborInferredTz
 
 # Naive capture times vs filesystem mtime (local wall clocks): “close enough” to treat as the same
 # ambiguity band — bounded by the largest plausible civil skew across zones (UTC−12 vs UTC+14 ≈ 26h).
@@ -130,6 +130,28 @@ def normalize_iana_timezone_name(s: str) -> str:
     return t
 
 
+def apply_neighbor_inferred_tz(
+    naive_dt: datetime, spec: NeighborInferredTz
+) -> datetime | None:
+    """
+    Turn naive EXIF into an aware datetime using a folder-neighbor inference spec.
+
+    Returns ``None`` if ``spec`` is empty or localization fails.
+    """
+    if naive_dt.tzinfo is not None:
+        return naive_dt
+    iana = (spec.iana or "").strip()
+    if iana:
+        return attach_gps_iana_zone_to_naive_exif(naive_dt, iana)
+    if spec.fixed_offset_total_seconds is None:
+        return None
+    try:
+        tz = timezone(timedelta(seconds=spec.fixed_offset_total_seconds))
+        return naive_dt.replace(tzinfo=tz)
+    except Exception:
+        return None
+
+
 def attach_gps_iana_zone_to_naive_exif(
     naive_dt: datetime, gps_iana_timezone_name: str | None
 ) -> datetime | None:
@@ -206,6 +228,7 @@ def filesystem_instant_for_rule(
         "filename_earlier_than_metadata",
         "exif_earlier_than_metadata",
         "embedded_timezone_authoritative",
+        "neighbor_folder_tz_inference",
         "filename_refines_metadata_seconds",
         "exif_matches_filename_clock",
     ):
